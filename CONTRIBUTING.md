@@ -24,12 +24,14 @@ pip install -r requirements.txt
 ### Tests & coverage
 
 ```bash
-python manage.py test
-coverage run manage.py test
+python -m pytest
+coverage run -m pytest
 coverage report
 ```
 
-`pyproject.toml` carries packaging metadata only. Line coverage thresholds live in **[`.coveragerc`](.coveragerc)** (`fail_under = 80`).
+Older `manage.py test` no longer discovers any tests (`apps/sms/tests.py` was removed after the pytest migration). Use **pytest-django**, configured in **`pyproject.toml`**.
+
+**`pyproject.toml`** holds pytest/pytest-django settings. Coverage thresholds remain in **[`.coveragerc`](.coveragerc)** (`fail_under = 80`).
 
 ### API authentication
 
@@ -50,7 +52,7 @@ curl -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:8000/api/sms/inbound/
 1. Prefer **explicit** service helpers (`persist_inbound_sms`, `dispatch_outbound_mmcli`) over fat views.
 2. Use **British English** in user-visible strings/comments (project convention).
 3. Keep **_modem / mmcli_** integrations inside `apps.sms` unless a second consumer appears.
-4. Run `python manage.py check` before opening a PR.
+4. Run `python manage.py check` **and** `python -m pytest` before opening a PR.
 
 ### Docker notes
 

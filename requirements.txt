@@ -17,3 +17,7 @@ gunicorn==23.0.0
 
 # ModemManager inbound SMS (system D-Bus)
 dbus-next>=0.2.3
+
+# Dev / test tooling
+pytest==8.3.5
+pytest-django==4.10.0

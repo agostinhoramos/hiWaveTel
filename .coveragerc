@@ -3,6 +3,7 @@ source = apps,config
 omit =
     */migrations/*
     */tests/*
+    tests/*
     manage.py
 
 [report]

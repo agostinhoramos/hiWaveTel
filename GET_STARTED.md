@@ -46,7 +46,7 @@ At repository root:
 
 ```bash
 ./tests/test_mmcli_host.sh
-coverage run manage.py test && coverage report
+coverage run -m pytest && coverage report
 ```
 
 Inside the running container:

@@ -1,3 +1,13 @@
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["test_*.py"]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers --tb=short -ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
