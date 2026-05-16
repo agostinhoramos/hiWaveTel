@@ -1,0 +1,51 @@
+# --- Environment / secrets (do not commit) ---
+.env
+.env.*
+!.env.example
+docker/.env
+!docker/.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# --- Django ---
+*.log
+db.sqlite3
+db.sqlite3-*
+/media/
+/staticfiles/
+
+# --- Test / quality tooling ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- IDEs / OS ---
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+.git
+.venv
+**/__pycache__
+*.py[cod]
+*$py.class
+.idea
+.cursor
+.cursorignore
+*.sqlite3
+.env
+.Python
+**/htmlcov/

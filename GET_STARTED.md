@@ -1,44 +1,56 @@
-sudo apt update
-sudo apt install software-properties-common -y
-sudo add-apt-repository ppa:deadsnakes/ppa -y
-sudo apt update
-sudo apt install python3.11 python3.11-venv python3.11-dev -y
+# Getting started
 
+Maintained reference docs: **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[docs/architecture.md](docs/architecture.md)**.
 
-mkdir hiWaveTel
+## Virtualenv (host)
 
-cd hiWaveTel
-
-python3.10 -m venv .venv
-
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-
 pip install --upgrade pip
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py createsuperuser  # needed for JWT-backed API access
+python manage.py runserver
+```
 
-python3.10 -m pip install -r requirements.txt
-# pip freeze > requirements.txt
+Environment:
 
-django-admin startproject config .
+- `DJANGO_SETTINGS_MODULE` defaults to **`config.settings`** (loads `development` or `production` from `DJANGO_ENV`).
+- Compose defaults to **`DJANGO_ENV=development`** with a dev-only `SECRET_KEY` fallback.
 
-mkdir apps
+## Authenticated API smoke test
 
-cd apps
+```bash
+TOKEN="$(curl -s -X POST http://127.0.0.1:8000/api/auth/token/ \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"YOU","password":"PASS"}' | python -c 'import sys,json; print(json.load(sys.stdin)["access"])')"
+curl -sf -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:8000/api/sms/inbound/
+```
 
-django-admin startapp core 
-# python3.10 manage.py startapp core
+`GET /api/health/` does **not** require a token (container probes).
 
-INSTALLED_APPS = [
-    ...
-    'apps.core',
-]
-apps/core/apps.py
-name = 'apps.core'
+## Modem / Docker quick path
 
-python3.10 manage.py makemigrations
-python3.10 manage.py migrate
+```bash
+docker compose -f docker/docker-compose.yml down
+docker compose -f docker/docker-compose.yml build --no-cache
+docker compose -f docker/docker-compose.yml up
+```
 
-python3.10 manage.py runserver
+Stop host **ModemManager** / **NetworkManager** before attaching USB modems to the container (see comments in `docker/docker-compose.yml`).
 
-deactivate
+## Quick checks (mmcli / Django quality)
 
-rm -rf .venv
+At repository root:
+
+```bash
+./tests/test_mmcli_host.sh
+coverage run manage.py test && coverage report
+```
+
+Inside the running container:
+
+```bash
+docker compose -f docker/docker-compose.yml exec hiwavetel bash /app/scripts/test_container_env.sh
+```

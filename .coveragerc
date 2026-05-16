@@ -1,0 +1,12 @@
+[run]
+source = apps,config
+omit =
+    */migrations/*
+    */tests/*
+    manage.py
+
+[report]
+fail_under = 80
+precision = 1
+show_missing = True
+skip_empty = True

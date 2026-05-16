@@ -1,0 +1,62 @@
+# hiWaveTel: Docker Compose ModemManager + Django privileged container + TTY/USB.
+#
+# Host network (`network_mode: host`) lets ModemManager see `wwan0` / QMI net devices in the same
+# namespace — avoids failures such as “Failed to find a net port in the QMI modem” on Docker bridge.
+# With host network, `ports:` mapping is ignored; Gunicorn binds directly on HIWAVE_PORT on the host.
+#
+# Read-only sysfs USB (`/sys/bus/usb`) aids ModemManager/udev enumeration and debugging; safe as `:ro`.
+# Remove that volume entry if your policy forbids sysfs visibility.
+#
+# Quectel EC25 in QMI mode: set MODEM_QMI_DEVICE=/dev/cdc-wdm0 in `.env`.
+#
+# Stop the host ModemManager before starting this container:
+#   sudo systemctl stop ModemManager NetworkManager
+#
+services:
+  hiwavetel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: hiwavetel
+    privileged: true
+    network_mode: host
+    env_file:
+      - ../.env
+    environment:
+      DJANGO_ENV: "${DJANGO_ENV:-development}"
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      HIWAVE_PORT: "${HIWAVE_PORT:-8000}"
+      SQLITE_DB_PATH: /data/db.sqlite3
+      RUN_SMS_WATCHER: "${RUN_SMS_WATCHER:-false}"
+      MODEM_TTY_PRIMARY: "${MODEM_TTY_PRIMARY:-/dev/ttyUSB2}"
+      MODEM_TTY_SECONDARY: "${MODEM_TTY_SECONDARY:-/dev/ttyUSB3}"
+      MODEM_LTE_INTERFACE: "${MODEM_LTE_INTERFACE:-wwan0}"
+      MODEM_STRICT_WWAN_CHECK: "${MODEM_STRICT_WWAN_CHECK:-false}"
+      MODEM_ENUMERATION_WAIT_SEC: "${MODEM_ENUMERATION_WAIT_SEC:-30}"
+      MODEM_ENABLE_WAIT_SEC: "${MODEM_ENABLE_WAIT_SEC:-20}"
+      MMCLI_SCAN_TRIES: "${MMCLI_SCAN_TRIES:-1}"
+      MMCLI_SCAN_SLEEP_SEC: "${MMCLI_SCAN_SLEEP_SEC:-1}"
+      MODEM_QMI_DEVICE: "${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}"
+      MODEM_MANAGER_DEBUG: "${MODEM_MANAGER_DEBUG:-false}"
+      # When AUTO_DETECT_MMCLI_INDEX=true and a modem was found, the entrypoint sets MODEM_MMCLI_INDEX from mmcli -L (Modem/N path).
+      AUTO_DETECT_MMCLI_INDEX: "${AUTO_DETECT_MMCLI_INDEX:-true}"
+      MODEM_MMCLI_INDEX: "${MODEM_MMCLI_INDEX:-0}"
+    volumes:
+      - hiwavetel_sqlite_data:/data
+      - /sys/bus/usb:/sys/bus/usb:ro
+    # ttyUSB2: AT SMS; ttyUSB3: AT backup; cdc-wdm0: QMI (required for QMI ModemManager).
+    devices:
+      - "${MODEM_TTY_PRIMARY:-/dev/ttyUSB2}:${MODEM_TTY_PRIMARY:-/dev/ttyUSB2}"
+      - "${MODEM_TTY_SECONDARY:-/dev/ttyUSB3}:${MODEM_TTY_SECONDARY:-/dev/ttyUSB3}"
+      - "${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}:${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -sf http://127.0.0.1:${HIWAVE_PORT:-8000}/api/health/ >/dev/null || exit 1"]
+      interval: 35s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+volumes:
+  hiwavetel_sqlite_data:

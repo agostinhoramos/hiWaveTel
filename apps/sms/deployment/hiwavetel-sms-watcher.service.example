@@ -1,0 +1,22 @@
+#
+# systemd example (adapt paths and user): copy to /etc/systemd/system/hiwavetel-sms-watcher.service
+#
+# Logs: journalctl -u hiwavetel-sms-watcher -f
+#
+
+[Unit]
+Description=hiWaveTel ModemManager inbound SMS watcher (D-Bus Messaging.Added)
+After=network.target ModemManager.service
+Wants=ModemManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hiWaveTel
+ExecStart=/opt/hiWaveTel/.venv/bin/python manage.py run_sms_watcher --modem-index 0
+Restart=always
+RestartSec=5
+Environment=DJANGO_SETTINGS_MODULE=config.settings
+
+[Install]
+WantedBy=multi-user.target
