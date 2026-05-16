@@ -43,7 +43,8 @@ Modules: `[config/settings/base.py](config/settings/base.py)` + `[development.py
 
 ### Authentication & observability
 
-- SMS list/create and OpenAPI schema/docs use **`rest_framework.permissions.IsAuthenticated`** plus **JWT** (SimpleJWT obtain/refresh under `/api/auth/`).
+- SMS **`/api/...`** list/create (**`/api/auth/**` excludes**) use **`IsAuthenticated`** and **JWT** (SimpleJWT under `/api/auth/`).
+- **`GET /api/schema/`** and **`GET /api/docs/`** use **spectacular defaults** (**`AllowAny`**) so the browser Swagger UI loads; endpoints under **`/api/sms/`** still require JWT for real data / actions after **Authorize**.
 - **`GET /api/health/`** remains **anonymous** (`JsonResponse`) for container / load balancer probes — it exposes only synthetic modem metadata, never SIM secrets.
 
 ### Data store

@@ -372,12 +372,16 @@ class MMCLIClientParseTests(TestCase):
         self.assertEqual(m.group(1), '/org/freedesktop/ModemManager1/SMS/2')
 
 
-class SpectacularProtectedTests(APITestCase):
-    """Schema + docs endpoints require JWT per ``IsAuthenticated``."""
+class SpectacularDocsPublicTests(APITestCase):
+    """OpenAPI schema + Swagger UI are public (Authorize in-browser for API calls)."""
 
-    def test_schema_requires_auth(self):
+    def test_schema_available_without_auth(self):
         resp = self.client.get(reverse('schema'))
-        self.assertIn(resp.status_code, (401, 403))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_swagger_ui_available_without_auth(self):
+        resp = self.client.get(reverse('swagger-ui'))
+        self.assertEqual(resp.status_code, 200)
 
 
 class AuthenticatedSpectacularTests(AuthAPITestCase):

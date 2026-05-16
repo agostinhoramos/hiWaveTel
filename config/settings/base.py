@@ -123,7 +123,8 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': (
         'SMS via ModemManager (mmcli); inbound persisted by D-Bus watcher. '
         'Obtain JWT tokens at `/api/auth/token/` and send `Authorization: Bearer <access>`. '
-        '`/api/schema/`, `/api/docs/` and `/api/` routes require authentication.'
+        'OpenAPI schema `/api/schema/` and Swagger UI `/api/docs/` are public; authenticated '
+        '`/api/` SMS routes still require JWT.'
     ),
     'VERSION': '1.0.0',
     'SECURITY_DEFINITIONS': {

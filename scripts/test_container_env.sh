@@ -37,8 +37,8 @@ PY
 PORT="${HIWAVE_PORT:-${PORT:-8000}}"
 code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/api/schema/")"
 case "${code}" in
-  200) log "/api/schema/ returned 200 — authenticate as a user with JWT normally required." ;;
-  401 | 403) log "/api/schema/ returned ${code} (expected when JWT is enforced)." ;;
+  200) log "/api/schema/ returned 200 — OpenAPI endpoint is served without auth." ;;
+  401 | 403) warn "/api/schema/ returned ${code} — expected 200 unless schema is locked down." ;;
   *) warn "/api/schema/ unexpected HTTP ${code} — confirm Gunicorn on ${PORT} matches HIWAVE_PORT." ;;
 esac
 
