@@ -5,6 +5,7 @@ Modem subsystem environment variables remain documented alongside ``manage.py`` 
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -18,6 +19,17 @@ def positive_int_env(name: str, default: int = 0) -> int:
         return v if v >= 0 else default
     except ValueError:
         return default
+
+
+def validated_log_level_name(name: str, default: str = 'INFO') -> str:
+    """Return a known logging level name for dictConfig (`APPLICATION_LOG_LEVEL`, etc.)."""
+    raw = os.environ.get(name, '').strip().upper()
+    if not raw:
+        return default
+    level = getattr(logging, raw, None)
+    if isinstance(level, int) and raw != 'NOTSET':
+        return raw
+    return default
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -135,6 +147,39 @@ SPECTACULAR_SETTINGS = {
         },
     },
     'SECURITY': [{'bearerAuth': []}],
+}
+
+# Persisted logs (single dictConfig — see docs/logging-file-contract.md).
+DJANGO_LOG_DIR = os.environ.get('DJANGO_LOG_DIR', '').strip() or str(BASE_DIR / 'logs')
+DJANGO_LOG_FILE = Path(os.environ.get('DJANGO_LOG_FILE', 'hiwavetel-api.log').strip() or 'hiwavetel-api.log').name
+APPLICATION_LOG_LEVEL = validated_log_level_name('APPLICATION_LOG_LEVEL', 'INFO')
+os.makedirs(DJANGO_LOG_DIR, mode=0o755, exist_ok=True)
+
+_LOG_FILE_PATH = str(Path(DJANGO_LOG_DIR) / DJANGO_LOG_FILE)
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'hiwavetel_file': {
+            'format': '%(asctime)s - %(levelname)s - %(message)s',
+        },
+    },
+    'handlers': {
+        'file_rotating': {
+            'level': APPLICATION_LOG_LEVEL,
+            'class': 'logging.handlers.TimedRotatingFileHandler',
+            'filename': _LOG_FILE_PATH,
+            'when': 'midnight',
+            'interval': 1,
+            'backupCount': 7,
+            'formatter': 'hiwavetel_file',
+        },
+    },
+    'root': {
+        'handlers': ['file_rotating'],
+        'level': APPLICATION_LOG_LEVEL,
+    },
 }
 
 SIMPLE_JWT = {}

@@ -25,6 +25,9 @@ services:
     environment:
       DJANGO_ENV: "${DJANGO_ENV:-development}"
       DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      DJANGO_LOG_DIR: "${DJANGO_LOG_DIR:-/app/logs}"
+      DJANGO_LOG_FILE: "${DJANGO_LOG_FILE:-hiwavetel-api.log}"
+      APPLICATION_LOG_LEVEL: "${APPLICATION_LOG_LEVEL:-INFO}"
       HIWAVE_PORT: "${HIWAVE_PORT:-8000}"
       SQLITE_DB_PATH: /data/db.sqlite3
       RUN_SMS_WATCHER: "${RUN_SMS_WATCHER:-false}"
@@ -43,6 +46,7 @@ services:
       MODEM_MMCLI_INDEX: "${MODEM_MMCLI_INDEX:-0}"
     volumes:
       - hiwavetel_sqlite_data:/data
+      - hiwavetel_logs:/app/logs
       - /sys/bus/usb:/sys/bus/usb:ro
     # ttyUSB2: AT SMS; ttyUSB3: AT backup; cdc-wdm0: QMI (required for QMI ModemManager).
     devices:
@@ -60,3 +64,4 @@ services:
 
 volumes:
   hiwavetel_sqlite_data:
+  hiwavetel_logs:

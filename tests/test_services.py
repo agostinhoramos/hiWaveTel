@@ -58,7 +58,7 @@ def test_persist_patches_existing_blank_strings():
 def test_dispatch_success_updates_state():
     outbound = OutboundSms.objects.create(
         modem_index=0,
-        to_number='+4412345678910',
+        to_number='+351913000387',
         text='svc',
         state=OutboundSms.State.CREATED,
     )
@@ -74,7 +74,7 @@ def test_dispatch_success_updates_state():
 def test_dispatch_send_failure_marks_failed():
     outbound = OutboundSms.objects.create(
         modem_index=0,
-        to_number='+4412345678910',
+        to_number='+351913000387',
         text='svc',
         state=OutboundSms.State.CREATED,
     )

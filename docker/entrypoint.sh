@@ -267,6 +267,9 @@ if [[ -n "${SQLITE_DB_PATH:-}" ]]; then
   mkdir -p "$(dirname "${SQLITE_DB_PATH}")"
 fi
 
+# Ensure log directory exists before Django boots (paired with SQLite path above).
+mkdir -p "${DJANGO_LOG_DIR:-/app/logs}"
+
 cd /app
 
 python manage.py migrate --noinput

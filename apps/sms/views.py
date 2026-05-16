@@ -114,7 +114,7 @@ class OutboundSmsViewSet(
         examples=[
             OpenApiExample(
                 name='Portuguese_mobile',
-                value={'modem_index': 0, 'to': '+4412345678910', 'text': 'Hello from hiWaveTel'},
+                value={'modem_index': 0, 'to': '+351913000387', 'text': 'Hello from hiWaveTel'},
                 request_only=True,
             ),
         ],

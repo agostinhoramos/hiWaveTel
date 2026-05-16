@@ -18,7 +18,7 @@ def test_outbound_serialiser_validates_digit_length():
 
 
 def test_outbound_serialiser_requires_text():
-    ser = OutboundSmsCreateSerializer(data={'to': '+4412345678910'})
+    ser = OutboundSmsCreateSerializer(data={'to': '+351913000387'})
     assert not ser.is_valid()
 
 
@@ -35,7 +35,7 @@ def test_inbound_str_representation(db):
 def test_outbound_str_representation(db):
     row = OutboundSms.objects.create(
         modem_index=0,
-        to_number='+4412345678910',
+        to_number='+351913000387',
         text='hello',
         state=OutboundSms.State.CREATED,
     )

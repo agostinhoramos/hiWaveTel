@@ -26,6 +26,8 @@ env/
 
 # --- Django ---
 *.log
+*.log.*
+logs/
 db.sqlite3
 db.sqlite3-*
 /media/

@@ -43,7 +43,7 @@ def test_outbound_create_fails_records_failed_state(mock_ensure, mock_create, mo
     mock_create.side_effect = MmcliError('modem busy', stderr='EBUSY', exit_code=1)
     resp = auth_client.post(
         reverse('sms-outbound-list'),
-        {'to': '+4412345678910', 'text': 'x'},
+        {'to': '+351913000387', 'text': 'x'},
         format='json',
     )
     assert resp.status_code == 202
@@ -92,7 +92,7 @@ def test_inbound_pagination_next_link_when_over_page_size(auth_client, two_inbou
         InboundSms(
             mm_path=f'/org/freedesktop/ModemManager1/SMS/bulk/{i}',
             modem_index=0,
-            from_number='+4412345678910',
+            from_number='+351913000387',
             text='x',
         )
         for i in range(9000, 9051)
@@ -122,7 +122,7 @@ def test_outbound_ensure_failure_marks_failed(mock_ensure, mock_create, mock_sen
     )
     resp = auth_client.post(
         reverse('sms-outbound-list'),
-        {'to': '+4412345678910', 'text': 'x'},
+        {'to': '+351913000387', 'text': 'x'},
         format='json',
     )
     assert resp.status_code == 202
