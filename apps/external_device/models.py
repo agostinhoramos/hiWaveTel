@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
+
+
+def default_hidishelink_api_url() -> str:
+    """Lazy default base URL for remote hiDisheLink REST API."""
+    return getattr(settings, 'HIDISHELINK_API_URL', 'http://192.168.1.77:5201').strip().rstrip('/')
 
 
 class ExternalDevice(models.Model):
@@ -50,6 +56,57 @@ class ExternalDevice(models.Model):
     def is_authenticated(self) -> bool:
         """Always return True for compatibility with DRF request.user."""
         return True
+
+
+class DeviceSession(models.Model):
+    """Server-side session for Android `/api/sms/device/login` contract."""
+
+    session_id = models.CharField(max_length=128, unique=True, db_index=True)
+    device = models.ForeignKey(
+        ExternalDevice,
+        on_delete=models.CASCADE,
+        related_name='device_sessions',
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['device', 'revoked_at', 'expires_at']),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.device_id_short()}… @{self.expires_at.isoformat(timespec="seconds")}'
+
+    def device_id_short(self) -> str:
+        return str(self.device_id)[:16]
+
+
+class DeviceHealthTelemetry(models.Model):
+    """MQTT health/ping tipo A (telemetria periódica da app Android)."""
+
+    device = models.ForeignKey(
+        ExternalDevice,
+        on_delete=models.CASCADE,
+        related_name='health_telemetry_rows',
+    )
+    timestamp_app = models.CharField(max_length=64, blank=True, help_text='Timestamp string from payload')
+    app_version = models.CharField(max_length=128, blank=True)
+    battery_level = models.SmallIntegerField(null=True, blank=True)
+    network_type = models.CharField(max_length=32, blank=True)
+    raw_payload = models.JSONField(default=dict, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-received_at']
+        indexes = [
+            models.Index(fields=['device', '-received_at']),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.device.device_id} @{self.received_at.isoformat(timespec="seconds")}'
 
 
 class SmsRequest(models.Model):
@@ -133,3 +190,84 @@ class InboxMessage(models.Model):
 
     def __str__(self) -> str:
         return f'{self.sender} → {self.device_id} @{self.received_at.isoformat(timespec="seconds")}'
+
+
+class HiDishelinkDevice(models.Model):
+    """Registered integration against a remote hiDisheLink server (REST + MQTT config in admin)."""
+
+    class Status(models.TextChoices):
+        UNCONFIGURED = 'unconfigured', 'Unconfigured'
+        REGISTERED = 'registered', 'Registered'
+        ACTIVE = 'active', 'Active'
+        ERROR = 'error', 'Error'
+
+    device_id = models.CharField(
+        max_length=64,
+        primary_key=True,
+        help_text='Device identifier on hiDisheLink (e.g. E.164 +351913000388)',
+    )
+    api_url = models.CharField(
+        max_length=512,
+        default=default_hidishelink_api_url,
+        help_text='Base URL only (no trailing path), e.g. http://192.168.1.77:5201',
+    )
+    api_key = models.TextField(
+        blank=True,
+        help_text='Plaintext api_key from hiDisheLink (admin-only; store securely)',
+    )
+    registration_token = models.CharField(
+        max_length=512,
+        blank=True,
+        help_text='Optional one-time registration token for POST /device/register/',
+    )
+    session_id = models.CharField(max_length=512, blank=True)
+    session_expires_at = models.DateTimeField(null=True, blank=True)
+    mqtt_config = models.JSONField(
+        null=True,
+        blank=True,
+        help_text='Last mqtt-config payload (flat dict with MQTT_* and TOPIC_* keys)',
+    )
+    mqtt_config_fetched_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.UNCONFIGURED,
+        db_index=True,
+    )
+    last_seen = models.DateTimeField(null=True, blank=True)
+    last_api_error = models.TextField(blank=True)
+    sync_external_device = models.BooleanField(
+        default=True,
+        help_text='If true, ensure an ExternalDevice row exists for MQTT inbox bridging',
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        verbose_name = 'HiDisheLink device'
+        verbose_name_plural = 'HiDisheLink devices'
+
+    def __str__(self) -> str:
+        return f'{self.device_id} ({self.status})'
+
+
+class MqttGatewayCatalogEntry(models.Model):
+    """Gateway-published modem snapshot or contacts payload received over MQTT (hiDisheLink alignment)."""
+
+    class Kind(models.TextChoices):
+        SNAPSHOT = 'snapshot', 'Snapshot'
+        CONTACTS = 'contacts', 'Contacts'
+
+    kind = models.CharField(max_length=16, choices=Kind.choices, db_index=True)
+    payload = models.JSONField(help_text='Raw JSON body from modems/snapshot or modems/contacts')
+    received_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-received_at']
+        verbose_name = 'MQTT modem catalog entry'
+        verbose_name_plural = 'MQTT modem catalog entries'
+
+    def __str__(self) -> str:
+        return f'{self.kind} @ {self.received_at.isoformat(timespec="seconds")}'

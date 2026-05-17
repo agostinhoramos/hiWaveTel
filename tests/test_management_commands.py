@@ -46,6 +46,7 @@ def test_run_command_maps_skip_sync_to_listener_snapshot(monkeypatch, skip_via_c
     assert captured['initial_snapshot'] is expected_snapshot
 
 
+@pytest.mark.django_db
 @patch('apps.external_device.management.commands.run_mqtt_gateway.GatewayMqttClient')
 def test_run_mqtt_gateway_connects_and_loops(mock_mqtt_client_class):
     """Should create client, connect, and start loop_forever."""
@@ -56,12 +57,13 @@ def test_run_mqtt_gateway_connects_and_loops(mock_mqtt_client_class):
     mock_client.loop_forever.return_value = None
     
     call_command('run_mqtt_gateway')
-    
-    mock_mqtt_client_class.assert_called_once()
+
+    mock_mqtt_client_class.assert_called_once_with(mqtt_config=None)
     mock_client.connect.assert_called_once()
     mock_client.loop_forever.assert_called_once()
 
 
+@pytest.mark.django_db
 @patch('apps.external_device.management.commands.run_mqtt_gateway.GatewayMqttClient')
 def test_run_mqtt_gateway_keyboard_interrupt(mock_mqtt_client_class, capsys):
     """Should disconnect gracefully on KeyboardInterrupt."""

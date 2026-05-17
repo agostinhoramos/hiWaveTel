@@ -1,0 +1,27 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo;
+  <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_label }}</a>
+  &rsaquo;
+  {% trans 'Send SMS' %}
+</div>
+{% endblock %}
+{% block content %}
+<h1>{% trans 'Send SMS' %} — {{ original.device_id }}</h1>
+{% if not is_active %}
+<p class="errornote">{% trans 'Device is not Active; sending is blocked (same rule as API v1).' %}</p>
+{% endif %}
+<p>{% trans 'Uses the server modem (mmcli), same as POST /api/v1/sms/send/. The modem index is taken from this device’s metadata key modem_index when set, otherwise from the server setting MODEM_MMCLI_INDEX (must match mmcli -L).' %}</p>
+<p>{% trans 'Adding rows under Inbox messages only records history; it does not transmit SMS. To actually send, use this form or the API.' %}</p>
+<form method="post">
+  {% csrf_token %}
+  <table>{{ form.as_table }}</table>
+  <div class="submit-row">
+    <input type="submit" class="default" value="{% trans 'Send' %}" {% if not is_active %}disabled{% endif %}>
+  </div>
+</form>
+<p><a href="{% url 'admin:external_device_externaldevice_change' original.pk %}">{% trans 'Back to device' %}</a></p>
+{% endblock %}

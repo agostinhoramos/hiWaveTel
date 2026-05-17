@@ -1,0 +1,8 @@
+{% extends "admin/change_form.html" %}
+{% load i18n %}
+{% block object-tools-items %}
+{{ block.super }}
+{% if hid_send_mqtt_url %}
+<li><a href="{{ hid_send_mqtt_url }}" class="addlink">{% trans "Publish MQTT JSON" %}</a></li>
+{% endif %}
+{% endblock %}

@@ -14,6 +14,7 @@ from apps.external_device.mqtt_client import (
     GatewayMqttClient,
     modem_index_from_status_request_topic,
     modem_mmcli_flat_fingerprint,
+    publish_health_ping_ephemeral,
     publish_modem_inbox_broadcast_ephemeral,
     publish_modem_inbox_delivery_ephemeral,
     publish_send_request_ephemeral,
@@ -82,7 +83,7 @@ class TestGatewayMqttClientInit:
         assert client.keepalive == 60
         assert client.qos == 1
         assert client.clean_session is True
-        assert client.topic_prefix == 'hiwavetel'
+        assert client.topic_prefix == 'hiwavetel/devices'
 
         mock_client_instance.username_pw_set.assert_called_once_with('testuser', 'testpass')
         mock_client_instance.tls_set.assert_not_called()
@@ -254,10 +255,14 @@ class TestGatewayMqttClientCallbacks:
         client = GatewayMqttClient()
         client._on_connect(mock_client_instance, None, {}, 0)
 
-        assert mock_client_instance.subscribe.call_count == 3
+        assert mock_client_instance.subscribe.call_count == 7
         expected_calls = [
             call('hiwavetel/devices/+/sms/status', qos=1),
             call('hiwavetel/devices/+/sms/inbox', qos=1),
+            call('hiwavetel/devices/+/health/ping', qos=0),
+            call('hiwavetel/devices/+/health/pong', qos=1),
+            call('hiwavetel/modems/snapshot', qos=1),
+            call('hiwavetel/modems/contacts', qos=1),
             call('hiwavetel/modems/+/status/request', qos=1),
         ]
         mock_client_instance.subscribe.assert_has_calls(expected_calls, any_order=True)
@@ -283,9 +288,83 @@ class TestGatewayMqttClientCallbacks:
         client = GatewayMqttClient()
         client._on_connect(mock_client_instance, None, {}, 0)
 
-        assert mock_client_instance.subscribe.call_count == 2
+        assert mock_client_instance.subscribe.call_count == 6
         topics_subscribed = {c[0][0] for c in mock_client_instance.subscribe.call_args_list}
         assert 'hiwavetel/modems/+/status/request' not in topics_subscribed
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_QOS=1,
+        MQTT_BROKER_URL='test-broker.local',
+        MQTT_PORT=1883,
+        MQTT_USER=None,
+        MQTT_PASS=None,
+        MQTT_CLIENT_ID='test-gateway',
+        MQTT_KEEPALIVE=60,
+        MQTT_CLEAN_SESSION=True,
+        MQTT_SUBSCRIBE_MODEM_CATALOG=False,
+    )
+    def test_on_connect_modem_catalog_subscription_disabled(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        client._on_connect(mock_client_instance, None, {}, 0)
+
+        assert mock_client_instance.subscribe.call_count == 5
+        topics_subscribed = {c[0][0] for c in mock_client_instance.subscribe.call_args_list}
+        assert 'hiwavetel/modems/snapshot' not in topics_subscribed
+        assert 'hiwavetel/modems/contacts' not in topics_subscribed
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_QOS=1,
+        MQTT_BROKER_URL='test-broker.local',
+        MQTT_PORT=1883,
+        MQTT_USER=None,
+        MQTT_PASS=None,
+        MQTT_CLIENT_ID='test-gateway',
+        MQTT_KEEPALIVE=60,
+        MQTT_CLEAN_SESSION=True,
+        MQTT_HEALTH_AUTO_PONG=False,
+    )
+    def test_on_connect_health_ping_subscription_disabled(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        client._on_connect(mock_client_instance, None, {}, 0)
+
+        assert mock_client_instance.subscribe.call_count == 6
+        topics_subscribed = {c[0][0] for c in mock_client_instance.subscribe.call_args_list}
+        assert 'hiwavetel/devices/+/health/ping' not in topics_subscribed
+        assert 'hiwavetel/devices/+/health/pong' in topics_subscribed
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_QOS=1,
+        MQTT_BROKER_URL='test-broker.local',
+        MQTT_PORT=1883,
+        MQTT_USER=None,
+        MQTT_PASS=None,
+        MQTT_CLIENT_ID='test-gateway',
+        MQTT_KEEPALIVE=60,
+        MQTT_CLEAN_SESSION=True,
+        MQTT_HEALTH_SUBSCRIBE_PONG=False,
+    )
+    def test_on_connect_health_pong_subscription_disabled(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        client._on_connect(mock_client_instance, None, {}, 0)
+
+        assert mock_client_instance.subscribe.call_count == 6
+        topics_subscribed = {c[0][0] for c in mock_client_instance.subscribe.call_args_list}
+        assert 'hiwavetel/devices/+/health/pong' not in topics_subscribed
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     def test_on_connect_failure(self, mock_mqtt_client_class):
@@ -362,6 +441,189 @@ class TestGatewayMqttClientOnMessage:
             mock_handle_inbox.assert_called_once()
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+        MQTT_QOS=1,
+        MQTT_BROKER_URL='test-broker.local',
+        MQTT_PORT=1883,
+        MQTT_USER=None,
+        MQTT_PASS=None,
+        MQTT_CLIENT_ID='test-gateway',
+        MQTT_KEEPALIVE=60,
+        MQTT_CLEAN_SESSION=True,
+    )
+    def test_on_message_health_ping_publishes_pong(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_pub_info = MagicMock()
+        mock_client_instance.publish.return_value = mock_pub_info
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        ping_ts = '2026-05-17T15:53:06.327825+00:00'
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({
+                'ping_id': 'ping_7af681dab77d',
+                'timestamp': ping_ts,
+            }).encode('utf-8'),
+        )
+
+        client._on_message(mock_client_instance, None, msg)
+
+        mock_client_instance.publish.assert_called_once()
+        pub_topic, pub_body = mock_client_instance.publish.call_args[0][:2]
+        assert pub_topic == 'pfx/devices/351912329317/health/pong'
+        body = json.loads(pub_body)
+        assert body['ping_id'] == 'ping_7af681dab77d'
+        assert body['source'] == 'hiwavetel_gateway'
+        assert body['ping_timestamp'] == ping_ts
+        assert 'timestamp' in body
+        mock_pub_info.wait_for_publish.assert_called_once_with(timeout=5.0)
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_HEALTH_AUTO_PONG=False,
+    )
+    def test_on_message_health_ping_skipped_when_disabled(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({'ping_id': 'x', 'source': 'django'}).encode('utf-8'),
+        )
+
+        client._on_message(mock_client_instance, None, msg)
+
+        mock_client_instance.publish.assert_not_called()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO=True,
+    )
+    def test_on_message_health_ping_django_publishes_pong_when_flag_on(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_pub_info = MagicMock()
+        mock_client_instance.publish.return_value = mock_pub_info
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({
+                'ping_id': 'ping_x',
+                'timestamp': '2026-05-17T12:00:05Z',
+                'source': 'django',
+            }).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        mock_client_instance.publish.assert_called_once()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_EXTERNAL_TOPIC_PREFIX='pfx')
+    def test_on_message_health_ping_django_skips_pong_by_default(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({
+                'ping_id': 'ping_x',
+                'source': 'django',
+            }).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        mock_client_instance.publish.assert_not_called()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_EXTERNAL_TOPIC_PREFIX='pfx')
+    def test_on_message_health_ping_telemetry_persisted(self, mock_mqtt_client_class):
+        from apps.external_device.models import DeviceHealthTelemetry, ExternalDevice
+
+        ExternalDevice.objects.create(
+            device_id='+351912329317',
+            name='Tel Device',
+            api_key_hash='x',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({
+                'timestamp': '2026-05-17T12:00:00Z',
+                'app_version': '1.0.0',
+                'battery_level': 85,
+                'network_type': 'WiFi',
+            }).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+
+        mock_client_instance.publish.assert_not_called()
+        rows = DeviceHealthTelemetry.objects.filter(device__device_id='+351912329317')
+        assert rows.count() == 1
+        assert rows.first().battery_level == 85
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    def test_on_message_health_pong_marks_device_seen(self, mock_mqtt_client_class):
+        from apps.external_device.models import ExternalDevice
+
+        ExternalDevice.objects.create(
+            device_id='+351913000387',
+            name='Ping Device',
+            api_key_hash='x',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='hiwavetel/devices/351913000387/health/pong',
+            payload=json.dumps({
+                'ping_id': 'ping_abc123def456',
+                'timestamp': '2026-05-17T16:00:00+00:00',
+                'app_version': '1.0.0',
+            }).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+
+        dev = ExternalDevice.objects.get(pk='+351913000387')
+        assert dev.last_seen is not None
+        assert dev.is_available is True
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_HEALTH_SUBSCRIBE_PONG=False)
+    def test_on_message_health_pong_skipped_when_disabled(self, mock_mqtt_client_class):
+        from apps.external_device.models import ExternalDevice
+
+        ExternalDevice.objects.create(
+            device_id='+351913000387',
+            name='Ping Device',
+            api_key_hash='x',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        before = ExternalDevice.objects.get(pk='+351913000387').last_seen
+        msg = SimpleNamespace(
+            topic='hiwavetel/devices/351913000387/health/pong',
+            payload=json.dumps({'ping_id': 'p'}).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        ExternalDevice.objects.get(pk='+351913000387').refresh_from_db()
+        assert ExternalDevice.objects.get(pk='+351913000387').last_seen == before
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
     def test_on_message_invalid_json(self, mock_mqtt_client_class):
         """Should handle invalid JSON gracefully."""
         mock_client_instance = MagicMock()
@@ -376,6 +638,49 @@ class TestGatewayMqttClientOnMessage:
 
         # Should not raise exception
         client._on_message(mock_client_instance, None, msg)
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @patch('apps.external_device.mqtt_client.persist_modem_catalog_from_mqtt')
+    def test_on_message_persists_modem_snapshot_catalog(self, mock_persist_catalog, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='hiwavetel/modems/snapshot',
+            payload=json.dumps({'ok': True}).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        mock_persist_catalog.assert_called_once_with('snapshot', {'ok': True})
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @patch('apps.external_device.mqtt_client.persist_modem_catalog_from_mqtt')
+    def test_on_message_persists_modem_contacts_catalog(self, mock_persist_catalog, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='hiwavetel/modems/contacts',
+            payload=json.dumps({'contacts': []}).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        mock_persist_catalog.assert_called_once_with('contacts', {'contacts': []})
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_SUBSCRIBE_MODEM_CATALOG=False)
+    @patch('apps.external_device.mqtt_client.persist_modem_catalog_from_mqtt')
+    def test_on_message_modem_catalog_skipped_when_disabled(self, mock_persist_catalog, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        msg = SimpleNamespace(
+            topic='hiwavetel/modems/snapshot',
+            payload=json.dumps({'x': 1}).encode('utf-8'),
+        )
+        client._on_message(mock_client_instance, None, msg)
+        mock_persist_catalog.assert_not_called()
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     def test_on_message_modem_status_empty_payload_schedules_snapshot(self, mock_mqtt_client_class):
@@ -786,6 +1091,33 @@ class TestEphemeralMqttPublish:
         publish_send_request_ephemeral('+1', {'request_id': 'r'})
 
 
+@pytest.mark.django_db
+class TestPublishHealthPingEphemeral:
+    @patch('apps.external_device.mqtt_client._publish_json_ephemeral', return_value=True)
+    def test_resolves_topic_from_template(self, mock_pub):
+        body, ok, topic = publish_health_ping_ephemeral(
+            '+351991234567',
+            mqtt_cfg={
+                'TOPIC_HEALTH_PING': 'hidishelink_dev/devices/{device_id}/health/ping',
+                'MQTT_BROKER_URL': 'mqtt.example',
+                'MQTT_PORT': 1883,
+            },
+        )
+        assert ok is True
+        assert topic == 'hidishelink_dev/devices/351991234567/health/ping'
+        assert body['source'] == 'django'
+        assert body['ping_id'].startswith('ping_')
+        mock_pub.assert_called_once()
+        call_kw = mock_pub.call_args
+        assert call_kw[0][0] == topic
+        assert call_kw[0][1]['ping_id'] == body['ping_id']
+
+    @patch('apps.external_device.mqtt_client._publish_json_ephemeral', return_value=False)
+    def test_returns_published_false_on_mqtt_failure(self, mock_pub):
+        _, ok, _ = publish_health_ping_ephemeral('+1', mqtt_cfg={'TOPIC_HEALTH_PING': 't/{device_id}/p'})
+        assert ok is False
+
+
 def test_modem_index_from_status_request_topic_parsing():
     assert modem_index_from_status_request_topic('hidishe/modems/7/status/request') == 7
     assert modem_index_from_status_request_topic('prefix/modems/0/status/request') == 0
@@ -865,7 +1197,7 @@ class TestGatewayModemTelemetryPublish:
                 assert json.loads(mock_ci.publish.call_args[0][1])['event'] == 'state_change'
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
-    @override_settings(MQTT_MODEM_STATUS_AUTO_PUBLISH=True)
+    @override_settings(MQTT_MODEM_STATUS_AUTO_PUBLISH=True, MQTT_HEALTH_SERVER_PING_INTERVAL_SEC=0)
     @patch('apps.external_device.mqtt_client.threading.Thread')
     def test_on_connect_spawns_modem_push_thread_when_auto_enabled(self, mock_thread, mqtt_cls):
         mock_ci = MagicMock()
@@ -879,8 +1211,32 @@ class TestGatewayModemTelemetryPublish:
         assert mock_thread.call_args.kwargs['daemon'] is True
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_MODEM_STATUS_AUTO_PUBLISH=False, MQTT_HEALTH_SERVER_PING_INTERVAL_SEC=0)
     @patch('apps.external_device.mqtt_client.threading.Thread')
     def test_on_connect_skips_modem_push_when_auto_disabled(self, mock_thread, mqtt_cls):
+        mock_ci = MagicMock()
+        mqtt_cls.return_value = mock_ci
+        client = GatewayMqttClient()
+        client._on_connect(mock_ci, None, {}, 0)
+        mock_thread.assert_not_called()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_MODEM_STATUS_AUTO_PUBLISH=False, MQTT_HEALTH_SERVER_PING_INTERVAL_SEC=30)
+    @patch('apps.external_device.mqtt_client.threading.Thread')
+    def test_on_connect_spawns_server_ping_thread_when_interval_positive(self, mock_thread, mqtt_cls):
+        mock_ci = MagicMock()
+        mqtt_cls.return_value = mock_ci
+        client = GatewayMqttClient()
+        client._on_connect(mock_ci, None, {}, 0)
+        mock_thread.assert_called_once()
+        bound = mock_thread.call_args.kwargs['target']
+        assert bound.__self__ is client
+        assert bound.__func__.__name__ == '_mqtt_server_ping_runner'
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(MQTT_MODEM_STATUS_AUTO_PUBLISH=False, MQTT_HEALTH_SERVER_PING_INTERVAL_SEC=0)
+    @patch('apps.external_device.mqtt_client.threading.Thread')
+    def test_on_connect_skips_server_ping_thread_when_interval_zero(self, mock_thread, mqtt_cls):
         mock_ci = MagicMock()
         mqtt_cls.return_value = mock_ci
         client = GatewayMqttClient()
@@ -893,8 +1249,61 @@ class TestGatewayModemTelemetryPublish:
         mqtt_cls.return_value = mock_ci
         client = GatewayMqttClient()
         client._modem_push_stop.clear()
+        client._mqtt_ping_stop.clear()
         client._on_disconnect(mock_ci, None, 1)
         assert client._modem_push_stop.is_set()
+        assert client._mqtt_ping_stop.is_set()
+
+
+@pytest.mark.django_db
+class TestGatewayServerHealthPing:
+    """Periodic Django health/ping publishes over the persistent MQTT session."""
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    def test_publish_server_health_ping_connected_payload(self, mqtt_cls):
+        mock_ci = MagicMock()
+        mqtt_cls.return_value = mock_ci
+        ExternalDevice.objects.create(
+            device_id='+351991111111',
+            name='ping-target',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+
+        gw = GatewayMqttClient()
+        mock_pub = MagicMock()
+        mock_info = MagicMock()
+        mock_pub.return_value = mock_info
+        gw.client.publish = mock_pub
+
+        gw._publish_server_health_ping_connected('+351991111111')
+
+        mock_pub.assert_called_once()
+        topic, payload_s = mock_pub.call_args[0][:2]
+        assert topic.endswith('/devices/351991111111/health/ping')
+        body = json.loads(payload_s)
+        assert body['source'] == 'django'
+        assert body['ping_id'].startswith('ping_')
+        mock_info.wait_for_publish.assert_called_once_with(timeout=5.0)
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    def test_mqtt_publish_scheduled_health_pings_skips_non_active(self, mqtt_cls):
+        mock_ci = MagicMock()
+        mqtt_cls.return_value = mock_ci
+        ExternalDevice.objects.create(
+            device_id='+inactive',
+            name='off',
+            status=ExternalDevice.Status.INACTIVE,
+        )
+        ExternalDevice.objects.create(
+            device_id='+active',
+            name='on',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+
+        gw = GatewayMqttClient()
+        with patch.object(gw, '_publish_server_health_ping_connected') as mock_ping:
+            gw._mqtt_publish_scheduled_health_pings()
+        mock_ping.assert_called_once_with('+active')
 
 
 def test_mqtt_short_client_id_length():

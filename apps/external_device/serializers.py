@@ -79,3 +79,13 @@ class DeviceHealthSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExternalDevice
         fields = ['device_id', 'status', 'is_available', 'last_seen']
+
+
+class DeviceHealthPingResponseSerializer(serializers.Serializer):
+    """Response after publishing an active MQTT health ping (hiDisheLink)."""
+
+    ping_id = serializers.CharField()
+    timestamp = serializers.CharField()
+    source = serializers.CharField()
+    published = serializers.BooleanField()
+    mqtt_topic = serializers.CharField()

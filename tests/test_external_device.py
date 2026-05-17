@@ -7,17 +7,33 @@ from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
-from django.test import override_settings
+from django.contrib import admin
+from django.contrib.auth import get_user_model
+from django.test import Client, override_settings
+from django.urls import reverse
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.test import APIClient
 
+from apps.external_device.admin import InboxMessageAdmin
 from apps.external_device.authentication import ApiKeyAuthentication, hash_api_key
-from apps.external_device.models import ExternalDevice, InboxMessage, SmsRequest, SmsRecipientStatus
+from apps.external_device.models import (
+    DeviceHealthTelemetry,
+    DeviceSession,
+    ExternalDevice,
+    HiDishelinkDevice,
+    InboxMessage,
+    MqttGatewayCatalogEntry,
+    SmsRecipientStatus,
+    SmsRequest,
+)
 from apps.external_device.mqtt_client import GatewayMqttClient, sanitize_device_id
 from apps.external_device.services import (
+    delete_external_device_and_dependencies,
     generate_token,
     hash_token,
     persist_inbox_from_mqtt,
+    persist_modem_catalog_from_mqtt,
     process_sms_request,
     register_device,
     sync_single_inbound_to_all_devices,
@@ -30,6 +46,20 @@ from apps.sms.models import InboundSms, OutboundSms
 def api_client():
     """DRF API client."""
     return APIClient()
+
+
+@pytest.fixture
+def admin_client(db):
+    """Logged-in Django admin user."""
+    User = get_user_model()
+    user = User.objects.create_superuser(
+        username='adm_ext_dev',
+        email='adm-ext@test.invalid',
+        password='pw-test-admin-ext-dev',
+    )
+    client = Client()
+    client.force_login(user)
+    return client
 
 
 @pytest.fixture
@@ -252,6 +282,52 @@ class TestSmsSend:
 
 
 @pytest.mark.django_db
+class TestProcessSmsRequestModemIndex:
+    """Outbound rows must use the same modem index convention as the JWT SMS API."""
+
+    @patch('apps.external_device.services.dispatch_outbound_mmcli')
+    def test_outbound_uses_device_metadata_modem_index(self, mock_dispatch, active_device):
+        def impl(ob):
+            ob.state = OutboundSms.State.SENT
+            ob.save()
+            return ob
+
+        mock_dispatch.side_effect = impl
+        active_device.metadata = {'modem_index': 5}
+        active_device.save(update_fields=['metadata'])
+        process_sms_request(active_device, ['+351913000111'], 'hello')
+        assert OutboundSms.objects.latest('pk').modem_index == 5
+
+    @patch('apps.external_device.services.dispatch_outbound_mmcli')
+    @override_settings(MODEM_MMCLI_INDEX=8)
+    def test_outbound_falls_back_to_settings_modem_index(self, mock_dispatch, active_device):
+        def impl(ob):
+            ob.state = OutboundSms.State.SENT
+            ob.save()
+            return ob
+
+        mock_dispatch.side_effect = impl
+        active_device.metadata = {}
+        active_device.save(update_fields=['metadata'])
+        process_sms_request(active_device, ['+351913000222'], 'hello')
+        assert OutboundSms.objects.latest('pk').modem_index == 8
+
+    @patch('apps.external_device.services.dispatch_outbound_mmcli')
+    @override_settings(MODEM_MMCLI_INDEX=3)
+    def test_invalid_metadata_modem_index_falls_back_to_settings(self, mock_dispatch, active_device):
+        def impl(ob):
+            ob.state = OutboundSms.State.SENT
+            ob.save()
+            return ob
+
+        mock_dispatch.side_effect = impl
+        active_device.metadata = {'modem_index': 'not-int'}
+        active_device.save(update_fields=['metadata'])
+        process_sms_request(active_device, ['+351913000333'], 'hello')
+        assert OutboundSms.objects.latest('pk').modem_index == 3
+
+
+@pytest.mark.django_db
 class TestSmsStatus:
     """Test SMS status endpoint."""
 
@@ -345,6 +421,29 @@ class TestDeviceHealth:
         assert response.data['status'] == 'active'
         assert 'is_available' in response.data
 
+    @patch('apps.external_device.views.publish_health_ping_ephemeral')
+    def test_post_health_ping_publishes_via_api(self, mock_ping, api_client, active_device):
+        mock_ping.return_value = (
+            {'ping_id': 'ping_deadbeef012', 'timestamp': '2026-05-17T12:00:00+00:00', 'source': 'django'},
+            True,
+            'pfx/devices/351913000002/health/ping',
+        )
+        api_client.credentials(HTTP_AUTHORIZATION=f'ApiKey {active_device.raw_api_key}')
+        url = f'/api/v1/external-devices/{active_device.device_id}/health/ping/'
+        response = api_client.post(url)
+
+        assert response.status_code == 200
+        assert response.data['ping_id'] == 'ping_deadbeef012'
+        assert response.data['source'] == 'django'
+        assert response.data['published'] is True
+        assert response.data['mqtt_topic'] == 'pfx/devices/351913000002/health/ping'
+        mock_ping.assert_called_once_with(active_device.device_id)
+
+    def test_post_health_ping_device_mismatch_forbidden(self, api_client, active_device):
+        api_client.credentials(HTTP_AUTHORIZATION=f'ApiKey {active_device.raw_api_key}')
+        response = api_client.post('/api/v1/external-devices/+999/health/ping/')
+        assert response.status_code == 403
+
 
 @pytest.mark.django_db
 class TestMqttHandlers:
@@ -371,6 +470,46 @@ class TestMqttHandlers:
         assert sms_request_obj.status == SmsRequest.Status.COMPLETED
         assert sms_request_obj.sent_count == 2
 
+    def test_update_request_from_mqtt_status_accepts_result_field(self, sms_request_obj):
+        payload = {
+            'result': 'SUCCESS',
+            'sent': 2,
+            'failed': 0,
+            'details': [],
+        }
+        sms_request_obj.status = SmsRequest.Status.PROCESSING
+        sms_request_obj.save(update_fields=['status'])
+
+        update_request_from_mqtt_status(sms_request_obj.request_id, payload)
+
+        sms_request_obj.refresh_from_db()
+        assert sms_request_obj.status == SmsRequest.Status.COMPLETED
+
+    def test_update_request_skips_duplicate_terminal_mqtt_update(self, active_device):
+        req = SmsRequest.objects.create(
+            request_id='sms_dup_terminal',
+            device=active_device,
+            recipients=['+1'],
+            message='x',
+            status=SmsRequest.Status.PROCESSING,
+            sent_count=0,
+            failed_count=0,
+        )
+        update_request_from_mqtt_status(
+            req.request_id,
+            {'status': 'success', 'sent': 1, 'failed': 0, 'details': []},
+        )
+        req.refresh_from_db()
+        assert req.status == SmsRequest.Status.COMPLETED
+        assert req.sent_count == 1
+
+        update_request_from_mqtt_status(
+            req.request_id,
+            {'status': 'success', 'sent': 99, 'failed': 0, 'details': []},
+        )
+        req.refresh_from_db()
+        assert req.sent_count == 1
+
     def test_persist_inbox_from_mqtt(self, active_device):
         """Persist inbox message from MQTT."""
         payload = {
@@ -385,6 +524,24 @@ class TestMqttHandlers:
         assert inbox_msg.message_id == 'inbox_mqtt_001'
         assert inbox_msg.sender == '+351911111111'
         assert inbox_msg.device == active_device
+
+    def test_persist_inbox_from_mqtt_field_aliases(self, active_device):
+        payload = {
+            'id': 'alias_mid',
+            'from': '+351900000000',
+            'text': 'via text',
+            'received_at': timezone.now().isoformat(),
+        }
+        inbox_msg = persist_inbox_from_mqtt(active_device, payload)
+        assert inbox_msg.message_id == 'alias_mid'
+        assert inbox_msg.sender == '+351900000000'
+        assert inbox_msg.body == 'via text'
+
+    def test_persist_modem_catalog_from_mqtt(self):
+        row = persist_modem_catalog_from_mqtt('snapshot', {'modems': [{'idx': 0}]})
+        assert isinstance(row, MqttGatewayCatalogEntry)
+        assert row.kind == 'snapshot'
+        assert row.payload['modems'][0]['idx'] == 0
 
     def test_sanitize_device_id(self):
         """Sanitize device ID removes + and # characters."""
@@ -442,6 +599,39 @@ class TestServices:
                 'priority': 'normal',
             },
         )
+
+    @override_settings(MQTT_PUBLISH_SEND_REQUEST=True, MQTT_SEND_RECIPIENTS_CHUNK_SIZE=2)
+    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
+    @patch('apps.external_device.services.dispatch_outbound_mmcli')
+    def test_process_sms_request_chunks_mqtt_recipients(self, mock_dispatch, mock_mqtt_publish, active_device):
+        def mock_dispatch_impl(outbound):
+            outbound.state = OutboundSms.State.SENT
+            outbound.save()
+            return outbound
+
+        mock_dispatch.side_effect = mock_dispatch_impl
+
+        recipients = ['+351910000001', '+351910000002', '+351910000003']
+        sms_request = process_sms_request(
+            device=active_device,
+            recipients=recipients,
+            message='Bulk',
+            priority='normal',
+        )
+
+        assert mock_mqtt_publish.call_count == 2
+        args1 = mock_mqtt_publish.call_args_list[0][0]
+        args2 = mock_mqtt_publish.call_args_list[1][0]
+        assert args1[0] == active_device.device_id
+        payload1 = args1[1]
+        payload2 = args2[1]
+        assert payload1['chunk_index'] == 1
+        assert payload1['chunk_total'] == 2
+        assert payload1['recipients'] == ['+351910000001', '+351910000002']
+        assert payload2['chunk_index'] == 2
+        assert payload2['chunk_total'] == 2
+        assert payload2['recipients'] == ['+351910000003']
+        assert payload1['request_id'] == sms_request.request_id
 
     @override_settings(MQTT_PUBLISH_SEND_REQUEST=False)
     @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
@@ -673,3 +863,210 @@ class TestServices:
         assert inbox_messages.count() == 2
         senders = {msg.sender for msg in inbox_messages}
         assert senders == {'+351911111111', '+351922222222'}
+
+
+@pytest.mark.django_db
+class TestExternalDeviceCascadeDelete:
+    def test_delete_external_device_and_dependencies_removes_protect_related(self):
+        raw_key = generate_token(32)
+        device = ExternalDevice.objects.create(
+            device_id='+351913000777',
+            name='Cascade Device',
+            api_key_hash=hash_api_key(raw_key),
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        HiDishelinkDevice.objects.create(device_id=device.device_id, api_url='http://example.invalid', api_key='k')
+        DeviceSession.objects.create(
+            session_id='s_sess_del_test123456789012345678901234567890',
+            device=device,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+        tel = DeviceHealthTelemetry.objects.create(device=device, raw_payload={'x': 1})
+        req = SmsRequest.objects.create(
+            request_id='req_cascade_del',
+            device=device,
+            recipients=['+1'],
+            message='m',
+        )
+        SmsRecipientStatus.objects.create(request=req, phone_number='+1', status=SmsRecipientStatus.Status.SENT)
+        InboxMessage.objects.create(
+            message_id='inbox_cascade_del',
+            device=device,
+            sender='+351910000000',
+            body='hi',
+            received_at=timezone.now(),
+        )
+
+        delete_external_device_and_dependencies(device)
+
+        assert not ExternalDevice.objects.filter(pk='+351913000777').exists()
+        assert not HiDishelinkDevice.objects.filter(pk='+351913000777').exists()
+        assert not SmsRequest.objects.filter(request_id='req_cascade_del').exists()
+        assert not InboxMessage.objects.filter(message_id='inbox_cascade_del').exists()
+        assert not DeviceSession.objects.filter(session_id='s_sess_del_test123456789012345678901234567890').exists()
+        assert not DeviceHealthTelemetry.objects.filter(pk=tel.pk).exists()
+
+
+@pytest.mark.django_db
+class TestExternalDeviceAdminSms:
+    """Smoke tests for ExternalDevice admin SMS send page and inbox sync action."""
+
+    def test_admin_send_sms_get_active_device(self, admin_client, active_device):
+        url = reverse(
+            'admin:external_device_externaldevice_sendsms',
+            args=[active_device.device_id],
+        )
+        response = admin_client.get(url)
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Send SMS' in content or 'send SMS' in content.lower()
+        assert 'recipient' in content.lower()
+        assert 'SMS body' in content or 'sms body' in content.lower()
+
+    def test_admin_send_sms_post_success_redirects(self, admin_client, active_device):
+        url = reverse(
+            'admin:external_device_externaldevice_sendsms',
+            args=[active_device.device_id],
+        )
+        mock_req = Mock(request_id='admin_smoke_rid', status='dispatched')
+        with patch('apps.external_device.admin.process_sms_request', return_value=mock_req):
+            response = admin_client.post(
+                url,
+                {
+                    'recipients': '+351912340001\n+351912340002',
+                    'message': 'Hi from admin test',
+                    'priority': 'normal',
+                },
+            )
+        assert response.status_code == 302
+        change_url = reverse(
+            'admin:external_device_externaldevice_change',
+            args=[active_device.device_id],
+        )
+        assert response['Location'].endswith(change_url)
+
+    def test_admin_send_sms_post_validation_error_stays_on_form(self, admin_client, active_device):
+        url = reverse(
+            'admin:external_device_externaldevice_sendsms',
+            args=[active_device.device_id],
+        )
+        with patch(
+            'apps.external_device.admin.process_sms_request',
+            side_effect=DRFValidationError({'recipients': ['Invalid recipient format.']}),
+        ):
+            response = admin_client.post(
+                url,
+                {
+                    'recipients': '+351912340001',
+                    'message': 'x',
+                    'priority': 'normal',
+                },
+            )
+        assert response.status_code == 200
+
+    def test_admin_send_sms_non_active_device_post_redirects_without_dispatch(self, admin_client, pending_device):
+        url = reverse(
+            'admin:external_device_externaldevice_sendsms',
+            args=[pending_device.device_id],
+        )
+        with patch('apps.external_device.admin.process_sms_request') as mock_proc:
+            response = admin_client.post(
+                url,
+                {
+                    'recipients': '+351912340001',
+                    'message': 'should not send',
+                    'priority': 'normal',
+                },
+            )
+        mock_proc.assert_not_called()
+        assert response.status_code == 302
+
+    def test_admin_sync_inbox_action_calls_service(self, admin_client, active_device):
+        changelist_url = reverse('admin:external_device_externaldevice_changelist')
+        with patch('apps.external_device.admin.sync_inbox_from_modem_store') as sync_mock:
+            response = admin_client.post(
+                changelist_url,
+                {
+                    'action': 'sync_inbox_from_modem',
+                    '_selected_action': active_device.device_id,
+                },
+            )
+        assert response.status_code == 302
+        sync_mock.assert_called_once()
+        assert sync_mock.call_args[0][0].pk == active_device.device_id
+
+    def test_admin_change_page_shows_inbox_preview_row(self, admin_client, active_device):
+        InboxMessage.objects.create(
+            message_id='admin_preview_mid',
+            device=active_device,
+            sender='+351910009999',
+            body='preview body',
+            received_at=timezone.now(),
+        )
+        change_url = reverse(
+            'admin:external_device_externaldevice_change',
+            args=[active_device.device_id],
+        )
+        response = admin_client.get(change_url)
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'admin_preview_mid' in content
+        assert '+351910009999' in content
+
+
+@pytest.mark.django_db
+class TestInboxMessageAdminAdd:
+    """InboxMessage admin add flow and received_at safeguards."""
+
+    def test_admin_add_inbox_message_post_succeeds(self, admin_client, active_device):
+        add_url = reverse('admin:external_device_inboxmessage_add')
+        response = admin_client.post(
+            add_url,
+            {
+                'device': active_device.device_id,
+                'sender': '+351910000011',
+                'body': 'Manual inbox row',
+                '_save': 'Save',
+            },
+        )
+        assert response.status_code == 302
+        row = InboxMessage.objects.get(sender='+351910000011', body='Manual inbox row')
+        assert row.device_id == active_device.device_id
+        assert row.message_id.startswith('inbox_manual_')
+        assert row.received_at is not None
+
+    def test_save_model_generates_message_id_when_blank(self, rf, active_device):
+        User = get_user_model()
+        user = User.objects.create_superuser('adm_inbox_mid', 'mid@test.invalid', 'pw')
+        request = rf.post('/admin/')
+        request.user = user
+
+        ma = InboxMessageAdmin(InboxMessage, admin.site)
+        obj = InboxMessage(
+            device=active_device,
+            sender='+351910000033',
+            body='midgen',
+            message_id='',
+        )
+        ma.save_model(request, obj, form=None, change=False)
+        obj.refresh_from_db()
+        assert obj.message_id.startswith('inbox_manual_')
+        assert obj.received_at is not None
+
+    def test_save_model_defaults_received_at_when_none_on_add(self, rf, active_device):
+        User = get_user_model()
+        user = User.objects.create_superuser('adm_inbox_ra', 'inbox_ra@test.invalid', 'pw')
+        request = rf.post('/admin/')
+        request.user = user
+
+        ma = InboxMessageAdmin(InboxMessage, admin.site)
+        obj = InboxMessage(
+            message_id='admin_save_mid_ra',
+            device=active_device,
+            sender='+351910000022',
+            body='body',
+        )
+        assert obj.received_at is None
+        ma.save_model(request, obj, form=None, change=False)
+        obj.refresh_from_db()
+        assert obj.received_at is not None

@@ -62,6 +62,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -142,6 +143,8 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Modem index for ``mmcli -m $N``. Confirm with ``mmcli -L`` where devices differ from the default.
@@ -162,7 +165,21 @@ MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'hiwavetel_gateway').strip()
 MQTT_KEEPALIVE = positive_int_env('MQTT_KEEPALIVE', 60)
 MQTT_QOS = positive_int_env('MQTT_QOS', 1)
 MQTT_CLEAN_SESSION = os.environ.get('MQTT_CLEAN_SESSION', 'false').lower() == 'true'
-MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_external').strip()
+MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_dev').strip()
+
+# Modem/catalog MQTT subtree (hiDisheLink: MQTT_BASE_TOPIC_PREFIX). Defaults to MQTT_EXTERNAL_TOPIC_PREFIX.
+MQTT_BASE_TOPIC_PREFIX = os.environ.get('MQTT_BASE_TOPIC_PREFIX', '').strip()
+if not MQTT_BASE_TOPIC_PREFIX:
+    MQTT_BASE_TOPIC_PREFIX = MQTT_EXTERNAL_TOPIC_PREFIX
+
+# Device-topic root (hiDisheLink: MQTT_DEVICE_TOPIC_PREFIX). Empty → derive at runtime as {MQTT_BASE_TOPIC_PREFIX}/devices.
+# Django/os.environ does not expand docker-compose ${VAR}; expand one common pattern explicitly.
+_mqtt_dev_topic_raw = os.environ.get('MQTT_DEVICE_TOPIC_PREFIX', '').strip()
+_mqtt_dev_ph = '${MQTT_BASE_TOPIC_PREFIX}'
+if _mqtt_dev_topic_raw.startswith(_mqtt_dev_ph):
+    _mqtt_dev_topic_raw = MQTT_BASE_TOPIC_PREFIX.rstrip('/') + _mqtt_dev_topic_raw[len(_mqtt_dev_ph) :]
+MQTT_DEVICE_TOPIC_PREFIX = _mqtt_dev_topic_raw
+
 MQTT_PUBLISH_SEND_REQUEST = truthy_env('MQTT_PUBLISH_SEND_REQUEST', default=True)
 MQTT_PUBLISH_MODEM_INBOX = truthy_env('MQTT_PUBLISH_MODEM_INBOX', default=False)
 _ephemeral_publish_timeout_raw = os.environ.get('MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC', '').strip()
@@ -198,6 +215,65 @@ except ValueError:
     MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
 if MQTT_MODEM_STATUS_POLL_INTERVAL_SEC < 0:
     MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
+
+MQTT_SUBSCRIBE_MODEM_CATALOG = truthy_env('MQTT_SUBSCRIBE_MODEM_CATALOG', default=True)
+MQTT_HEALTH_AUTO_PONG = truthy_env('MQTT_HEALTH_AUTO_PONG', default=True)
+MQTT_HEALTH_PING_SUBSCRIBE_QOS = positive_int_env('MQTT_HEALTH_PING_SUBSCRIBE_QOS', 0)
+if MQTT_HEALTH_PING_SUBSCRIBE_QOS > 2:
+    MQTT_HEALTH_PING_SUBSCRIBE_QOS = 0
+MQTT_HEALTH_SUBSCRIBE_PONG = truthy_env('MQTT_HEALTH_SUBSCRIBE_PONG', default=True)
+
+# run_mqtt_gateway: publish tipo B health/ping (source=django) for each active ExternalDevice on this interval (0 = off)
+_mqtt_srv_ping_interval_raw = os.environ.get('MQTT_HEALTH_SERVER_PING_INTERVAL_SEC', '60').strip()
+try:
+    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = (
+        float(_mqtt_srv_ping_interval_raw) if _mqtt_srv_ping_interval_raw else 60.0
+    )
+except ValueError:
+    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = 0.0
+if MQTT_HEALTH_SERVER_PING_INTERVAL_SEC < 0:
+    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = 0.0
+
+MQTT_SEND_RECIPIENTS_CHUNK_SIZE = positive_int_env('MQTT_SEND_RECIPIENTS_CHUNK_SIZE', 50)
+if MQTT_SEND_RECIPIENTS_CHUNK_SIZE <= 0:
+    MQTT_SEND_RECIPIENTS_CHUNK_SIZE = 50
+
+# Remote hiDisheLink REST (admin integration — fetch MQTT config, device onboarding)
+HIDISHELINK_API_URL = os.environ.get('HIDISHELINK_API_URL', 'http://192.168.1.77:5201').strip().rstrip('/')
+HIDISHELINK_API_TIMEOUT_SEC = positive_int_env('HIDISHELINK_API_TIMEOUT_SEC', 30)
+if HIDISHELINK_API_TIMEOUT_SEC <= 0:
+    HIDISHELINK_API_TIMEOUT_SEC = 30
+
+# Android `/api/sms/device/` session TTL (login + refresh)
+HIDISHELINK_SESSION_TTL_HOURS = positive_int_env('HIDISHELINK_SESSION_TTL_HOURS', 24)
+if HIDISHELINK_SESSION_TTL_HOURS <= 0:
+    HIDISHELINK_SESSION_TTL_HOURS = 24
+
+# Optional jitter fraction for mqtt-config map (sec. 5 client contract)
+_raw_jitter = os.environ.get('MQTT_RECONNECT_JITTER', '0.2').strip()
+try:
+    MQTT_RECONNECT_JITTER = float(_raw_jitter) if _raw_jitter else 0.2
+except ValueError:
+    MQTT_RECONNECT_JITTER = 0.2
+
+# Gateway MQTT: respond with pong when ping has exact source=django (labs only; Android handles normally)
+MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO = truthy_env('MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO', default=False)
+
+# Default SMS inbox flag exposed to Android mqtt-config (`SMS_INBOX_ENABLED`)
+SMS_INBOX_ENABLED_DEFAULT = truthy_env('SMS_INBOX_ENABLED_DEFAULT', default=True)
+
+# MQTT client tuning (mirrors hiDisheLink mqtt-config; optional fallbacks when no remote config)
+MQTT_AUTO_RECONNECT = truthy_env('MQTT_AUTO_RECONNECT', default=True)
+MQTT_CONNECTION_TIMEOUT = positive_int_env('MQTT_CONNECTION_TIMEOUT', 30)
+MQTT_RECONNECT_INITIAL_DELAY_MS = positive_int_env('MQTT_RECONNECT_INITIAL_DELAY_MS', 1000)
+MQTT_RECONNECT_MAX_DELAY_MS = positive_int_env('MQTT_RECONNECT_MAX_DELAY_MS', 30000)
+_raw_bm = os.environ.get('MQTT_RECONNECT_BACKOFF_MULTIPLIER', '2').strip()
+try:
+    MQTT_RECONNECT_BACKOFF_MULTIPLIER = float(_raw_bm) if _raw_bm else 2.0
+except ValueError:
+    MQTT_RECONNECT_BACKOFF_MULTIPLIER = 2.0
+MQTT_RECONNECT_MAX_RETRIES = positive_int_env('MQTT_RECONNECT_MAX_RETRIES', 0)
+MQTT_CONNECTION_WATCHDOG_INTERVAL_MS = positive_int_env('MQTT_CONNECTION_WATCHDOG_INTERVAL_MS', 0)
 
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',

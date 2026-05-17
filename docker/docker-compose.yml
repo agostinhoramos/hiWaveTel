@@ -24,7 +24,9 @@ services:
       - ../.env
     environment:
       DJANGO_ENV: "${DJANGO_ENV:-development}"
-      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      # DJANGO_ALLOWED_HOSTS: only from env_file ../.env — not duplicated here, because
+      # Compose interpolates ${VAR} from the project-directory .env (often docker/.env),
+      # which would override the repo-root .env and keep the fallback localhost,127.0.0.1.
       DJANGO_LOG_DIR: "${DJANGO_LOG_DIR:-/app/logs}"
       DJANGO_LOG_FILE: "${DJANGO_LOG_FILE:-hiwavetel-api.log}"
       APPLICATION_LOG_LEVEL: "${APPLICATION_LOG_LEVEL:-INFO}"
@@ -52,7 +54,9 @@ services:
       # When AUTO_DETECT_MMCLI_INDEX=true and a modem was found, the entrypoint sets MODEM_MMCLI_INDEX from mmcli -L (Modem/N path).
       AUTO_DETECT_MMCLI_INDEX: "${AUTO_DETECT_MMCLI_INDEX:-true}"
       MODEM_MMCLI_INDEX: "${MODEM_MMCLI_INDEX:-0}"
-      MQTT_EXTERNAL_TOPIC_PREFIX: "${MQTT_EXTERNAL_TOPIC_PREFIX:-hidishelink_external}"
+      MQTT_EXTERNAL_TOPIC_PREFIX: "${MQTT_EXTERNAL_TOPIC_PREFIX:-hidishelink_dev}"
+      MQTT_BASE_TOPIC_PREFIX: "${MQTT_BASE_TOPIC_PREFIX:-}"
+      MQTT_DEVICE_TOPIC_PREFIX: "${MQTT_DEVICE_TOPIC_PREFIX:-}"
       # Modem SMS → MQTT: broadcast = {prefix}/modems/N/sms/inbox_delivery (one message); per_device = per-device topic
       MQTT_PUBLISH_MODEM_INBOX: "${MQTT_PUBLISH_MODEM_INBOX:-true}"
       MQTT_PUBLISH_SEND_REQUEST: "${MQTT_PUBLISH_SEND_REQUEST:-true}"

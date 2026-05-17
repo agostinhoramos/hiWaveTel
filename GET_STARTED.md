@@ -1,6 +1,6 @@
 # Getting started
 
-Maintained reference docs: **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[docs/architecture.md](docs/architecture.md)**.
+Maintained reference docs: **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[docs/architecture.md](docs/architecture.md)** · **[docs/comunicacao.md](docs/comunicacao.md)** (HTTP + MQTT: API v1, JWT, tópicos e exemplos para integração externa).
 
 ## Virtualenv (host)
 

@@ -35,6 +35,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 WORKDIR /app
 COPY . /app/
 
+RUN cd /app && python manage.py collectstatic --noinput
+
 COPY docker/entrypoint.sh /docker/entrypoint.sh
 RUN chmod +x /docker/entrypoint.sh
 

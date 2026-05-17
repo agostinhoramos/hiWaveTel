@@ -16,9 +16,39 @@ from rest_framework.exceptions import ValidationError
 from apps.sms.models import OutboundSms
 from apps.sms.services import dispatch_outbound_mmcli
 
-from .models import ExternalDevice, InboxMessage, SmsRecipientStatus, SmsRequest
+from .models import (
+    DeviceHealthTelemetry,
+    DeviceSession,
+    ExternalDevice,
+    HiDishelinkDevice,
+    InboxMessage,
+    MqttGatewayCatalogEntry,
+    SmsRecipientStatus,
+    SmsRequest,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def modem_index_for_external_device(device: ExternalDevice) -> int:
+    """Modem index for ``mmcli -m N`` when sending on behalf of an external device.
+
+    Uses ``device.metadata['modem_index']`` when it is a valid int (same convention as
+    inbox sync); otherwise ``settings.MODEM_MMCLI_INDEX`` — matching the JWT outbound
+    SMS API behaviour.
+    """
+    meta = device.metadata or {}
+    raw = meta.get('modem_index')
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                'Device %s metadata.modem_index=%r invalid; using MODEM_MMCLI_INDEX',
+                device.device_id,
+                raw,
+            )
+    return int(getattr(settings, 'MODEM_MMCLI_INDEX', 0))
 
 
 def generate_token(length: int = 48) -> str:
@@ -140,10 +170,12 @@ def process_sms_request(
 
         sent_count = 0
         failed_count = 0
+        modem_ix = modem_index_for_external_device(device)
 
         for recipient in recipients:
             try:
                 outbound = OutboundSms.objects.create(
+                    modem_index=modem_ix,
                     to_number=recipient.strip(),
                     text=message,
                     state=OutboundSms.State.CREATED,
@@ -189,16 +221,25 @@ def process_sms_request(
     _LOGGER.info('SMS request %s processed: %d sent, %d failed', request_id, sent_count, failed_count)
 
     if getattr(settings, 'MQTT_PUBLISH_SEND_REQUEST', False):
-        mqtt_payload: dict[str, Any] = {
-            'request_id': request_id,
-            'recipients': list(recipients),
-            'message': message,
-            'priority': priority,
-        }
+        chunk_sz = max(1, int(getattr(settings, 'MQTT_SEND_RECIPIENTS_CHUNK_SIZE', 50)))
+        recips = list(recipients)
+        total_chunks = max(1, (len(recips) + chunk_sz - 1) // chunk_sz)
         try:
             from apps.external_device.mqtt_client import publish_send_request_ephemeral
 
-            publish_send_request_ephemeral(device.device_id, mqtt_payload)
+            for i in range(0, len(recips), chunk_sz):
+                chunk = recips[i : i + chunk_sz]
+                chunk_index = i // chunk_sz + 1
+                mqtt_payload: dict[str, Any] = {
+                    'request_id': request_id,
+                    'recipients': chunk,
+                    'message': message,
+                    'priority': priority,
+                }
+                if total_chunks > 1:
+                    mqtt_payload['chunk_index'] = chunk_index
+                    mqtt_payload['chunk_total'] = total_chunks
+                publish_send_request_ephemeral(device.device_id, mqtt_payload)
         except Exception:
             _LOGGER.warning(
                 'MQTT publish_send_request_ephemeral failed for request_id=%s device=%s',
@@ -223,7 +264,12 @@ def update_request_from_mqtt_status(request_id: str, payload: dict[str, Any]) ->
         _LOGGER.warning('SmsRequest %s not found for MQTT status update', request_id)
         return
 
-    mqtt_status = payload.get('status', '').lower()
+    mqtt_status_raw = (payload.get('status') or payload.get('result') or '')
+    mqtt_status = str(mqtt_status_raw).strip().lower()
+    if not mqtt_status:
+        _LOGGER.warning('MQTT status missing status/result for request_id=%s payload_keys=%s', request_id, list(payload))
+        return
+
     sent = payload.get('sent', 0)
     failed = payload.get('failed', 0)
     details = payload.get('details', [])
@@ -236,6 +282,16 @@ def update_request_from_mqtt_status(request_id: str, payload: dict[str, Any]) ->
     }
 
     new_status = status_map.get(mqtt_status, SmsRequest.Status.PROCESSING)
+
+    terminal = {
+        SmsRequest.Status.COMPLETED,
+        SmsRequest.Status.PARTIAL,
+        SmsRequest.Status.FAILED,
+    }
+    incoming_terminal = mqtt_status in ('success', 'partial', 'error')
+    if sms_request.status in terminal and incoming_terminal:
+        _LOGGER.debug('Skipping duplicate terminal MQTT status for request_id=%s', request_id)
+        return
 
     with transaction.atomic():
         sms_request.status = new_status
@@ -267,20 +323,49 @@ def update_request_from_mqtt_status(request_id: str, payload: dict[str, Any]) ->
     _LOGGER.info('Updated SMS request %s from MQTT: status=%s, sent=%d, failed=%d', request_id, new_status, sent, failed)
 
 
+def persist_modem_catalog_from_mqtt(kind: str, payload: dict[str, Any]) -> MqttGatewayCatalogEntry:
+    """Store gateway-published modem snapshot or contacts JSON for operator review."""
+    return MqttGatewayCatalogEntry.objects.create(kind=kind, payload=payload)
+
+
+def _mqtt_first_nonempty_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        val = payload.get(key)
+        if val is None:
+            continue
+        s = val.strip() if isinstance(val, str) else str(val).strip()
+        if s:
+            return s
+    return ''
+
+
 def persist_inbox_from_mqtt(device: ExternalDevice, payload: dict[str, Any]) -> InboxMessage:
     """Persist an incoming SMS message from external device MQTT inbox topic.
     
     Args:
         device: The device reporting the message.
         payload: MQTT inbox payload with message_id, sender, body, timestamp.
+        Aliases (hiDisheLink): id, from, text|message, received_at.
         
     Returns:
         The created or existing InboxMessage.
     """
-    message_id = payload.get('message_id', '').strip()
-    sender = payload.get('sender', '').strip()
-    body = payload.get('body', '')
-    timestamp_str = payload.get('timestamp', '')
+    message_id = _mqtt_first_nonempty_str(payload, ('message_id', 'id'))
+    sender = _mqtt_first_nonempty_str(payload, ('sender', 'from'))
+    if payload.get('body') is not None:
+        body = payload.get('body')
+    elif payload.get('text') is not None:
+        body = payload.get('text')
+    elif payload.get('message') is not None:
+        body = payload.get('message')
+    else:
+        body = ''
+    body = '' if body is None else str(body)
+
+    timestamp_raw = payload.get('timestamp')
+    if timestamp_raw is None or (isinstance(timestamp_raw, str) and not timestamp_raw.strip()):
+        timestamp_raw = payload.get('received_at')
+    timestamp_str = '' if timestamp_raw is None else str(timestamp_raw).strip()
 
     if not message_id or not sender:
         _LOGGER.warning('Invalid inbox payload: missing message_id or sender')
@@ -624,3 +709,34 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
         skipped_count,
         active_count,
     )
+
+
+def delete_external_device_and_dependencies(device: ExternalDevice) -> dict[str, int]:
+    """Remove ``ExternalDevice`` and rows blocked by ``PROTECT`` (SMS/inbox), sessions, telemetry, HiDisheLink row."""
+    pk = device.device_id
+    stats: dict[str, int] = {}
+    with transaction.atomic():
+        n, _ = SmsRequest.objects.filter(device=device).delete()
+        stats['sms_requests'] = n
+
+        n, _ = InboxMessage.objects.filter(device=device).delete()
+        stats['inbox_messages'] = n
+
+        n, _ = DeviceSession.objects.filter(device=device).delete()
+        stats['device_sessions'] = n
+
+        n, _ = DeviceHealthTelemetry.objects.filter(device=device).delete()
+        stats['health_telemetry'] = n
+
+        n, _ = HiDishelinkDevice.objects.filter(pk=pk).delete()
+        stats['hidishelink_devices'] = n
+
+        device.delete()
+        stats['external_devices'] = 1
+
+    _LOGGER.info(
+        'ExternalDevice cascade delete device_id=%s stats=%s',
+        pk,
+        stats,
+    )
+    return stats

@@ -37,5 +37,6 @@ urlpatterns = [
     path('api/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/v1/', include('apps.external_device.urls')),
+    path('api/sms/device/', include('apps.external_device.device_urls')),
     path('api/', include('apps.sms.urls')),
 ]

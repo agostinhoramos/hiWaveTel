@@ -14,7 +14,9 @@ from rest_framework.views import APIView
 
 from .authentication import ApiKeyAuthentication, IsActiveExternalDevice
 from .models import ExternalDevice, InboxMessage, SmsRequest
+from .mqtt_client import publish_health_ping_ephemeral
 from .serializers import (
+    DeviceHealthPingResponseSerializer,
     DeviceHealthSerializer,
     InboxMessageSerializer,
     RegisterDeviceSerializer,
@@ -198,3 +200,39 @@ class DeviceHealthView(RetrieveAPIView):
     def get(self, request: Request, *args, **kwargs) -> Response:
         """Get device health status."""
         return super().get(request, *args, **kwargs)
+
+
+class DeviceHealthPingView(APIView):
+    """Publish active MQTT health ping (hiDisheLink) so the gateway/app can answer with ``health/pong``."""
+
+    authentication_classes = [ApiKeyAuthentication]
+    permission_classes = [IsActiveExternalDevice]
+
+    @extend_schema(
+        request=None,
+        responses={200: DeviceHealthPingResponseSerializer},
+        summary='Publish MQTT health ping',
+        description=(
+            'Publishes a JSON ping with ``source: django`` on ``TOPIC_HEALTH_PING`` from mqtt-config '
+            '(or legacy `{prefix}/devices/{sanitized}/health/ping`). Broker credentials come from '
+            'stored HiDisheLink mqtt-config when present, otherwise Django MQTT env settings.'
+        ),
+        tags=['External Device'],
+    )
+    def post(self, request: Request, device_id: str) -> Response:
+        auth_device = request.user
+        if not isinstance(auth_device, ExternalDevice):
+            return Response({'error': 'Invalid authentication.'}, status=status.HTTP_401_UNAUTHORIZED)
+        if auth_device.device_id != device_id:
+            return Response({'error': 'Device mismatch.'}, status=status.HTTP_403_FORBIDDEN)
+
+        body, ok, topic = publish_health_ping_ephemeral(auth_device.device_id)
+        payload = {
+            'ping_id': body['ping_id'],
+            'timestamp': body['timestamp'],
+            'source': body['source'],
+            'published': ok,
+            'mqtt_topic': topic,
+        }
+        ser = DeviceHealthPingResponseSerializer(payload)
+        return Response(ser.data, status=status.HTTP_200_OK)
