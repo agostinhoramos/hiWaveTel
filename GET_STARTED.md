@@ -40,6 +40,10 @@ docker compose -f docker/docker-compose.yml up
 
 Stop host **ModemManager** / **NetworkManager** before attaching USB modems to the container (see comments in `docker/docker-compose.yml`).
 
+### SQLite concurrency (default deploy)
+
+SQLite does not tolerate many simultaneous writers well. Compose passes **`SQLITE_BUSY_TIMEOUT_SEC`**, WAL-related pragmas, and backoff retries during inbound modem SMS persistence; inbound rows are serialized across **SMS worker** threads inside the gateway process. If `database is locked` still appears under heavy concurrent API + modem traffic, increase those env tuning knobs or migrate to Postgres.
+
 ## Quick checks (mmcli / Django quality)
 
 At repository root:

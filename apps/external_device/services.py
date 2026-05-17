@@ -6,7 +6,7 @@ import hashlib
 import logging
 import secrets
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import Any
 
 from django.conf import settings
 from django.db import transaction
@@ -17,9 +17,6 @@ from apps.sms.models import OutboundSms
 from apps.sms.services import dispatch_outbound_mmcli
 
 from .models import ExternalDevice, InboxMessage, SmsRecipientStatus, SmsRequest
-
-if TYPE_CHECKING:
-    from typing import Any, Tuple
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -190,6 +187,26 @@ def process_sms_request(
         sms_request.save()
 
     _LOGGER.info('SMS request %s processed: %d sent, %d failed', request_id, sent_count, failed_count)
+
+    if getattr(settings, 'MQTT_PUBLISH_SEND_REQUEST', False):
+        mqtt_payload: dict[str, Any] = {
+            'request_id': request_id,
+            'recipients': list(recipients),
+            'message': message,
+            'priority': priority,
+        }
+        try:
+            from apps.external_device.mqtt_client import publish_send_request_ephemeral
+
+            publish_send_request_ephemeral(device.device_id, mqtt_payload)
+        except Exception:
+            _LOGGER.warning(
+                'MQTT publish_send_request_ephemeral failed for request_id=%s device=%s',
+                request_id,
+                device.device_id,
+                exc_info=True,
+            )
+
     return sms_request
 
 
@@ -381,12 +398,13 @@ def sync_inbox_from_modem_store(device: ExternalDevice) -> None:
         )
 
 
-def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
+def _mirror_to_device(inbound, device: ExternalDevice) -> tuple[bool, bool, bool]:
     """
     Mirror InboundSms to a single device.
-    
+
     Returns:
-        (created, skipped) tuple
+        (created, skipped, emit_mqtt_delivery): ``emit_mqtt_delivery`` is True when the mirror
+        transitioned to content worth notifying (new row with sender/body or patch filling them).
     """
     _LOGGER.debug(
         'sync_single_inbound_to_all_devices: processing device=%s pk=%s status=%s',
@@ -394,10 +412,10 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
         device.pk,
         device.status,
     )
-    
+
     metadata = device.metadata or {}
     device_modem_index = metadata.get('modem_index')
-    
+
     if device_modem_index is not None:
         try:
             if int(device_modem_index) != inbound.modem_index:
@@ -407,22 +425,22 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
                     device_modem_index,
                     inbound.modem_index,
                 )
-                return (False, True)  # not created, skipped
+                return (False, True, False)  # not created, skipped
         except (TypeError, ValueError):
             _LOGGER.warning(
                 'sync_single_inbound_to_all_devices: device=%s has invalid modem_index=%r, treating as no filter',
                 device.device_id,
                 device_modem_index,
             )
-    
+
     message_id = f'mmcli_{inbound.pk}_dev_{device.pk}'
-    
+
     _LOGGER.debug(
         'sync_single_inbound_to_all_devices: attempting get_or_create for device=%s message_id=%s',
         device.device_id,
         message_id,
     )
-    
+
     inbox_msg, created = InboxMessage.objects.get_or_create(
         message_id=message_id,
         defaults={
@@ -434,6 +452,7 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
         },
     )
 
+    patched_fields: list[str] = []
     if created:
         _LOGGER.debug(
             'sync_single_inbound_to_all_devices: created InboxMessage for device=%s',
@@ -450,9 +469,10 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
             for k, v in patched.items():
                 setattr(inbox_msg, k, v)
             inbox_msg.save(update_fields=list(patched.keys()))
+            patched_fields = list(patched.keys())
             _LOGGER.debug(
                 'sync_single_inbound_to_all_devices: patched InboxMessage for device=%s fields=%s',
-                device.device_id, list(patched.keys()),
+                device.device_id, patched_fields,
             )
         else:
             _LOGGER.debug(
@@ -460,7 +480,16 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> Tuple[bool, bool]:
                 device.device_id,
             )
 
-    return (created, False)  # created, not skipped
+    emit_mqtt_delivery = False
+    has_sender = bool((inbox_msg.sender or '').strip())
+    has_body = bool((inbox_msg.body or '').strip())
+    if has_sender or has_body:
+        if created and (has_body or has_sender):
+            emit_mqtt_delivery = True
+        elif patched_fields and ('body' in patched_fields or 'sender' in patched_fields):
+            emit_mqtt_delivery = True
+
+    return (created, False, emit_mqtt_delivery)  # created, not skipped
 
 
 def sync_single_inbound_to_all_devices(inbound) -> None:
@@ -491,18 +520,88 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
 
     created_count = 0
     skipped_count = 0
+    mirrored_for_delivery: list[tuple[str, int]] = []
+    mqtt_mode = getattr(settings, 'MQTT_MODEM_INBOX_DELIVERY_MODE', 'broadcast')
 
     for device in active_devices:
         try:
-            created, skipped = _mirror_to_device(inbound, device)
+            created, skipped, emit_delivery = _mirror_to_device(inbound, device)
             if created:
                 created_count += 1
             if skipped:
                 skipped_count += 1
+            if emit_delivery:
+                mirrored_for_delivery.append((device.device_id, device.pk))
+            if (
+                getattr(settings, 'MQTT_PUBLISH_MODEM_INBOX', False)
+                and emit_delivery
+                and mqtt_mode == 'per_device'
+            ):
+                try:
+                    from apps.external_device.mqtt_client import publish_modem_inbox_delivery_ephemeral
+
+                    publish_modem_inbox_delivery_ephemeral(
+                        device.device_id,
+                        {
+                            'message_id': f'mmcli_{inbound.pk}_dev_{device.pk}',
+                            'sender': inbound.from_number or '',
+                            'body': inbound.text or '',
+                            'received_at': inbound.created_at.isoformat(),
+                        },
+                    )
+                    _LOGGER.info(
+                        'MQTT modem inbox_delivery (per_device) published device=%s inbound_pk=%s',
+                        device.device_id,
+                        inbound.pk,
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        'MQTT publish_modem_inbox_delivery_ephemeral failed device=%s inbound_pk=%s',
+                        device.device_id,
+                        inbound.pk,
+                        exc_info=True,
+                    )
         except Exception as exc:
             _LOGGER.exception(
                 'Mirror to device=%s failed for InboundSms pk=%s: %s',
                 device.device_id, inbound.pk, exc,
+            )
+
+    if (
+        getattr(settings, 'MQTT_PUBLISH_MODEM_INBOX', False)
+        and mirrored_for_delivery
+        and mqtt_mode == 'broadcast'
+    ):
+        try:
+            from apps.external_device.mqtt_client import publish_modem_inbox_broadcast_ephemeral
+
+            mirrored_device_ids = [did for did, _pk in mirrored_for_delivery]
+            device_message_ids = {
+                did: f'mmcli_{inbound.pk}_dev_{pk}' for did, pk in mirrored_for_delivery
+            }
+            publish_modem_inbox_broadcast_ephemeral(
+                inbound.modem_index,
+                {
+                    'message_id': f'mmcli_{inbound.pk}',
+                    'sender': inbound.from_number or '',
+                    'body': inbound.text or '',
+                    'received_at': inbound.created_at.isoformat(),
+                    'modem_index': inbound.modem_index,
+                    'mirrored_device_ids': mirrored_device_ids,
+                    'device_message_ids': device_message_ids,
+                },
+            )
+            _LOGGER.info(
+                'MQTT modem inbox_delivery (broadcast) published modem_index=%s inbound_pk=%s devices=%s',
+                inbound.modem_index,
+                inbound.pk,
+                mirrored_device_ids,
+            )
+        except Exception:
+            _LOGGER.warning(
+                'MQTT publish_modem_inbox_broadcast_ephemeral failed inbound_pk=%s',
+                inbound.pk,
+                exc_info=True,
             )
 
     _LOGGER.info(

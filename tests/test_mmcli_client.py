@@ -180,3 +180,23 @@ def test_created_path_regex_matches_mmcli_stdout():
     m = _CREATED_PATH_RE.search(out)
     assert m is not None
     assert m.group(1) == '/org/freedesktop/ModemManager1/SMS/2'
+
+
+def test_show_modem_merges_keyvalue_and_json():
+    """``show_modem`` uses the same dual-run approach as ``show_sms``."""
+    client = MMCLIClient()
+    kv = CompletedProcess(
+        ['mmcli'],
+        0,
+        stdout='modem.generic.state:\tenabled\n',
+        stderr='',
+    )
+    json_ok = CompletedProcess(
+        ['mmcli'],
+        0,
+        stdout='{"modem":{"generic":{"manufacturer":"ACME"}}}',
+        stderr='',
+    )
+    with patch.object(MMCLIClient, '_run', side_effect=[kv, json_ok]):
+        merged = client.show_modem(0)
+    assert 'modem.generic.state' in merged or 'modemgenericstate' in merged

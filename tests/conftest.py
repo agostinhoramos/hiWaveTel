@@ -7,6 +7,12 @@ import pytest
 from django.contrib.auth import get_user_model
 
 
+@pytest.fixture(autouse=True)
+def disable_modem_status_auto_publish(settings):
+    """Avoid background mmcli telemetry threads when tests trigger MQTT `_on_connect` (default is on in Compose)."""
+    settings.MQTT_MODEM_STATUS_AUTO_PUBLISH = False
+
+
 @pytest.fixture
 def api_client():
     from rest_framework.test import APIClient

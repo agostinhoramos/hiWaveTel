@@ -162,6 +162,35 @@ class MMCLIClient:
         err = ((cp.stderr or "") + "\n" + (cp.stdout or "")).strip()
         return (cp.returncode == 0), err[:2000]
 
+    def show_modem(self, modem_index: int) -> dict[str, str]:
+        """Fetch modem overview from mmcli (key-value + JSON merge, analogous to ``show_sms``)."""
+        mi = str(modem_index)
+        cp_kv = self._run([self.mmcli_path, '-m', mi, '--output-keyvalue'])
+        if cp_kv.returncode != 0:
+            raise MmcliError(
+                'Failed to inspect modem (--output-keyvalue)',
+                stdout=cp_kv.stdout or '',
+                stderr=cp_kv.stderr or '',
+                exit_code=cp_kv.returncode,
+            )
+        kv_data = _parse_keyvalue(cp_kv.stdout or '')
+
+        js_data: dict[str, str] = {}
+        cp_js = self._run([self.mmcli_path, '-m', mi, '--output-json'])
+        if cp_js.returncode == 0 and (cp_js.stdout or '').strip():
+            try:
+                js_data = _normalize_mmcli_json(cp_js.stdout or '')
+            except (json.JSONDecodeError, ValueError):
+                js_data = {}
+        merged_main = _merge_mmcli_sources(kv_data, js_data)
+        if merged_main:
+            return merged_main
+
+        cp_plain = self._run([self.mmcli_path, '-m', mi])
+        self._ensure_ok(cp_plain, 'mmcli -m')
+        fallback = _parse_keyvalue(cp_plain.stdout or '')
+        return _merge_mmcli_sources(kv_data, js_data, fallback)
+
     def create_sms(self, modem_index: int, number: str, text: str) -> str:
         text_esc = self._quote_field(text)
         num_esc = self._quote_field(number)

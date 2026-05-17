@@ -31,7 +31,14 @@ services:
       HIWAVE_PORT: "${HIWAVE_PORT:-8000}"
       # Bind-mount project root as /app/host so db.sqlite3 can be created automatically (file bind-mounts fail when missing).
       SQLITE_DB_PATH: "${SQLITE_DB_PATH:-/app/host/db.sqlite3}"
+      # SQLite concurrency: busy timeout + WAL + inbound persist retries (SMS queue + HTTP).
+      SQLITE_BUSY_TIMEOUT_SEC: "${SQLITE_BUSY_TIMEOUT_SEC:-30}"
+      SQLITE_INIT_WAL: "${SQLITE_INIT_WAL:-true}"
+      SQLITE_SYNCHRONOUS_NORMAL: "${SQLITE_SYNCHRONOUS_NORMAL:-true}"
+      SQLITE_LOCKED_RETRY_COUNT: "${SQLITE_LOCKED_RETRY_COUNT:-15}"
+      SQLITE_LOCKED_RETRY_BACKOFF_SEC: "${SQLITE_LOCKED_RETRY_BACKOFF_SEC:-0.02}"
       RUN_SMS_WATCHER: "${RUN_SMS_WATCHER:-true}"
+      RUN_MQTT_GATEWAY: "${RUN_MQTT_GATEWAY:-true}"
       MODEM_TTY_PRIMARY: "${MODEM_TTY_PRIMARY:-/dev/ttyUSB2}"
       MODEM_TTY_SECONDARY: "${MODEM_TTY_SECONDARY:-/dev/ttyUSB3}"
       MODEM_LTE_INTERFACE: "${MODEM_LTE_INTERFACE:-wwan0}"
@@ -46,6 +53,15 @@ services:
       AUTO_DETECT_MMCLI_INDEX: "${AUTO_DETECT_MMCLI_INDEX:-true}"
       MODEM_MMCLI_INDEX: "${MODEM_MMCLI_INDEX:-0}"
       MQTT_EXTERNAL_TOPIC_PREFIX: "${MQTT_EXTERNAL_TOPIC_PREFIX:-hidishelink_external}"
+      # Modem SMS → MQTT: broadcast = {prefix}/modems/N/sms/inbox_delivery (one message); per_device = per-device topic
+      MQTT_PUBLISH_MODEM_INBOX: "${MQTT_PUBLISH_MODEM_INBOX:-true}"
+      MQTT_PUBLISH_SEND_REQUEST: "${MQTT_PUBLISH_SEND_REQUEST:-true}"
+      MQTT_MODEM_INBOX_DELIVERY_MODE: "${MQTT_MODEM_INBOX_DELIVERY_MODE:-broadcast}"
+      MQTT_MODEM_STATUS_SUBSCRIBE: "${MQTT_MODEM_STATUS_SUBSCRIBE:-true}"
+      MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC: "${MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC:-45}"
+      # After MQTT connect/reconnect: publish {prefix}/modems/N/status/telemetry; poll modem state changes when POLL_INTERVAL_SEC>0.
+      MQTT_MODEM_STATUS_AUTO_PUBLISH: "${MQTT_MODEM_STATUS_AUTO_PUBLISH:-true}"
+      MQTT_MODEM_STATUS_POLL_INTERVAL_SEC: "${MQTT_MODEM_STATUS_POLL_INTERVAL_SEC:-30}"
       SMS_QUEUE_WORKERS: "${SMS_QUEUE_WORKERS:-3}"
       SMS_QUEUE_MAX_SIZE: "${SMS_QUEUE_MAX_SIZE:-1000}"
     volumes:

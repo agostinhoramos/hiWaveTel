@@ -7,6 +7,7 @@ from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -19,6 +20,7 @@ from apps.external_device.services import (
     persist_inbox_from_mqtt,
     process_sms_request,
     register_device,
+    sync_single_inbound_to_all_devices,
     update_request_from_mqtt_status,
 )
 from apps.sms.models import InboundSms, OutboundSms
@@ -408,8 +410,9 @@ class TestServices:
         assert len(hashed) == 64
         assert all(c in '0123456789abcdef' for c in hashed)
 
+    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
-    def test_process_sms_request(self, mock_dispatch, active_device):
+    def test_process_sms_request(self, mock_dispatch, mock_mqtt_publish, active_device):
         """Process SMS request creates request and dispatches to modem."""
         def mock_dispatch_impl(outbound):
             outbound.state = OutboundSms.State.SENT
@@ -429,6 +432,39 @@ class TestServices:
         assert sms_request.status == SmsRequest.Status.COMPLETED
         assert sms_request.sent_count == 1
         assert sms_request.failed_count == 0
+
+        mock_mqtt_publish.assert_called_once_with(
+            active_device.device_id,
+            {
+                'request_id': sms_request.request_id,
+                'recipients': ['+351912345678'],
+                'message': 'Test message',
+                'priority': 'normal',
+            },
+        )
+
+    @override_settings(MQTT_PUBLISH_SEND_REQUEST=False)
+    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
+    @patch('apps.external_device.services.dispatch_outbound_mmcli')
+    def test_process_sms_request_skips_mqtt_when_disabled(
+        self,
+        mock_dispatch,
+        mock_mqtt_publish,
+        active_device,
+    ):
+        def mock_dispatch_impl(outbound):
+            outbound.state = OutboundSms.State.SENT
+            outbound.save()
+
+        mock_dispatch.side_effect = mock_dispatch_impl
+
+        process_sms_request(
+            device=active_device,
+            recipients=['+351912345678'],
+            message='Test message',
+            priority='normal',
+        )
+        mock_mqtt_publish.assert_not_called()
 
     def test_register_device_service(self, pending_device):
         """Register device service function works correctly."""
@@ -458,6 +494,122 @@ class TestServices:
         assert inbox.exists()
         assert inbox.first().message_id == f'mmcli_{inbound.pk}_dev_{active_device.pk}'
         assert inbox.first().body == 'Signal triggered message'
+
+    @override_settings(MQTT_PUBLISH_MODEM_INBOX=True, MQTT_MODEM_INBOX_DELIVERY_MODE='broadcast')
+    @patch('apps.external_device.mqtt_client.publish_modem_inbox_broadcast_ephemeral')
+    def test_modem_mirror_publishes_mqtt_broadcast_when_enabled(self, mock_broadcast_mqtt, active_device):
+        InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/mm_mqtt_mirror',
+            modem_index=0,
+            from_number='+351911112222',
+            text='modem body MQTT',
+        )
+        mock_broadcast_mqtt.assert_called_once()
+        modem_idx, payload = mock_broadcast_mqtt.call_args[0]
+        assert modem_idx == 0
+        assert payload['sender'] == '+351911112222'
+        assert payload['body'] == 'modem body MQTT'
+        assert 'received_at' in payload
+        assert payload['mirrored_device_ids'] == [active_device.device_id]
+        mid_rest = payload['message_id'][len('mmcli_'):]
+        assert payload['device_message_ids'][active_device.device_id] == f'mmcli_{mid_rest}_dev_{active_device.pk}'
+
+    @override_settings(MQTT_PUBLISH_MODEM_INBOX=True, MQTT_MODEM_INBOX_DELIVERY_MODE='broadcast')
+    @patch('apps.external_device.mqtt_client.publish_modem_inbox_broadcast_ephemeral')
+    def test_modem_inbox_broadcast_single_publish_two_devices(self, mock_broadcast):
+        d_a = ExternalDevice.objects.create(
+            device_id='+351913000701',
+            name='Dev A',
+            device_type='modem',
+            api_key_hash=hash_api_key(generate_token(48)),
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        d_b = ExternalDevice.objects.create(
+            device_id='+351913000702',
+            name='Dev B',
+            device_type='modem',
+            api_key_hash=hash_api_key(generate_token(48)),
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/bcast_two',
+            modem_index=3,
+            from_number='+351900',
+            text='same sms',
+        )
+        mock_broadcast.assert_called_once()
+        modem_idx, payload = mock_broadcast.call_args[0]
+        assert modem_idx == 3
+        assert payload['message_id'] == f'mmcli_{inbound.pk}'
+        ids = sorted(payload['mirrored_device_ids'])
+        assert ids == sorted([d_a.device_id, d_b.device_id])
+        assert payload['device_message_ids'][d_a.device_id] == f'mmcli_{inbound.pk}_dev_{d_a.pk}'
+        assert payload['device_message_ids'][d_b.device_id] == f'mmcli_{inbound.pk}_dev_{d_b.pk}'
+
+    @override_settings(MQTT_PUBLISH_MODEM_INBOX=True, MQTT_MODEM_INBOX_DELIVERY_MODE='per_device')
+    @patch('apps.external_device.mqtt_client.publish_modem_inbox_delivery_ephemeral')
+    def test_modem_inbox_per_device_publishes_per_external_device(self, mock_per_dev):
+        ExternalDevice.objects.create(
+            device_id='+351913000801',
+            name='Dev 1',
+            device_type='modem',
+            api_key_hash=hash_api_key(generate_token(48)),
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        ExternalDevice.objects.create(
+            device_id='+351913000802',
+            name='Dev 2',
+            device_type='modem',
+            api_key_hash=hash_api_key(generate_token(48)),
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/pd_twice',
+            modem_index=1,
+            from_number='+351988',
+            text='dual',
+        )
+        assert mock_per_dev.call_count == 2
+
+    @override_settings(MQTT_PUBLISH_MODEM_INBOX=True, MQTT_MODEM_INBOX_DELIVERY_MODE='per_device')
+    @patch('apps.external_device.mqtt_client.publish_modem_inbox_delivery_ephemeral')
+    def test_modem_mirror_per_device_payload(self, mock_deliver_mqtt, active_device):
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/mm_mqtt_mirror_pd',
+            modem_index=0,
+            from_number='+351911112222',
+            text='modem body MQTT',
+        )
+        mock_deliver_mqtt.assert_called_once()
+        device_id_arg, mqtt_payload = mock_deliver_mqtt.call_args[0]
+        assert device_id_arg == active_device.device_id
+        assert mqtt_payload['message_id'] == f'mmcli_{inbound.pk}_dev_{active_device.pk}'
+        assert mqtt_payload['sender'] == '+351911112222'
+
+    def test_manual_resync_broadcast_mode_no_extra_duplicate_mqtt_stub(self):
+        """Calling sync_single_inbound_to_all_devices again does not re-emit if nothing new to patch."""
+        with override_settings(
+            MQTT_PUBLISH_MODEM_INBOX=True,
+            MQTT_MODEM_INBOX_DELIVERY_MODE='broadcast',
+        ), patch(
+            'apps.external_device.mqtt_client.publish_modem_inbox_broadcast_ephemeral'
+        ) as mock_b:
+            ExternalDevice.objects.create(
+                device_id='+351913000903',
+                name='once',
+                device_type='modem',
+                api_key_hash=hash_api_key(generate_token(48)),
+                status=ExternalDevice.Status.ACTIVE,
+            )
+            inbound = InboundSms.objects.create(
+                mm_path='/org/freedesktop/ModemManager1/SMS/resync_bc',
+                modem_index=2,
+                from_number='+351955',
+                text='once',
+            )
+            assert mock_b.call_count == 1
+            sync_single_inbound_to_all_devices(inbound)
+            assert mock_b.call_count == 1
 
     def test_inbox_sync_respects_modem_index_when_set(self):
         """sync_inbox_from_modem_store filters by modem_index when set in metadata."""

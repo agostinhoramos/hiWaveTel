@@ -139,9 +139,18 @@ Valores por defeito em `config/settings/base.py` (sobrescreveveis por variáveis
 |----------|-------------------|
 | `MQTT_BROKER_URL` | `localhost` |
 | `MQTT_PORT` | `1883` (se `8883`, o cliente ativa TLS) |
-| `MQTT_USER` / `MQTT_PASS` | vazio ou credenciais do broker |
+| `MQTT_USER` / `MQTT_PASS` | vazio ou credenciais do broker (aspas no `.env` são removidas) |
 | `MQTT_CLIENT_ID` | `hiwavetel_gateway` |
 | `MQTT_EXTERNAL_TOPIC_PREFIX` | `hidishelink_external` |
+| `MQTT_PUBLISH_SEND_REQUEST` | `true` por defeito: após cada `POST …/sms/send/` o gateway publica também o JSON em `…/sms/send` no broker |
+| `MQTT_PUBLISH_MODEM_INBOX` | No **Compose** oficial o valor por defeito passado ao contentor é `true` (`docker-compose.yml`) — cada SMS modem espelhada na inbox gera pelo menos uma notificação MQTT (ver modo abaixo). Em `manage.py`/pytest sem essa env, falta declarar explicitamente (`false` só no código Django se a variável estiver omitida). |
+| `MQTT_MODEM_INBOX_DELIVERY_MODE` | `broadcast` (**defeito**): uma publicação canónica em `{prefix}/modems/{modem_index}/sms/inbox_delivery` com `message_id` tipo `mmcli_<pk>`, listas opcionais `mirrored_device_ids` e mapa `device_message_ids`. `per_device`: comportamento legado — `{prefix}/devices/{id_sanitizado}/sms/inbox_delivery`, um publish por `ExternalDevice` que espelhou a mesma entrada. |
+| `MQTT_MODEM_STATUS_SUBSCRIBE` | `true` por defeito: o gateway subscreve `{prefix}/modems/+/status/request` e responde em `…/status/response` com JSON de estado do modem (`mmcli`). Defina `false` para não subscrever (útil quando só se usa o modo efémero de inbox/send). |
+| `MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC` | Timeout em segundos para cada comando `mmcli` usado a construir esse snapshot (`45` por defeito). |
+| `MQTT_MODEM_STATUS_AUTO_PUBLISH` | `true` por defeito: ligado ao broker, o gateway enumera os modems com `mmcli -L`, publica o snapshot em `{prefix}/modems/N/status/telemetry` no arranque (e após cada reconexão bem sucedida) e opcionalmente em mudanças de estado (polling). |
+| `MQTT_MODEM_STATUS_POLL_INTERVAL_SEC` | Intervalo entre verificações de mudança de estado (`30` por defeito). **`0`** desactiva o polling mas mantém a publicação de arranque/reconexão. |
+| `MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC` | `15`: timeout (s) sobre `publish` QoS antes de libertar ligação curta desde o worker Gunicorn |
+| Docker `RUN_MQTT_GATEWAY` | `true` por defeito no `docker-compose.yml`: arranca `manage.py run_mqtt_gateway` em background (subscribe `status` / `inbox`) |
 
 Prefixo real dos tópicos: **`{MQTT_EXTERNAL_TOPIC_PREFIX}`** (ex.: `hidishelink_external`).
 
@@ -156,13 +165,20 @@ Exemplo: dispositivo `+351913000001` → segmento `351913000001`.
 
 - `{prefix}/devices/+/sms/status`
 - `{prefix}/devices/+/sms/inbox`
+- `{prefix}/modems/+/status/request` quando `MQTT_MODEM_STATUS_SUBSCRIBE` é verdadeiro (**defeito**)
 
 **O gateway publica:**
 
-- `{prefix}/devices/{device_id_sanitizado}/sms/send`
+- `{prefix}/devices/{device_id_sanitizado}/sms/send` (notificação de pedidos de envio originados pela API HTTP; mesmo contrato §3.3)
 - `{prefix}/devices/{device_id_sanitizado}/sms/inbox/ack`
+- Com `MQTT_PUBLISH_MODEM_INBOX=true`:
+  - **Modo recomendado** (`MQTT_MODEM_INBOX_DELIVERY_MODE=broadcast`, **defeito**): `{prefix}/modems/{modem_index}/sms/inbox_delivery` — uma cópia canónica da SMS quando o espelho da inbox ficou útil aos subscritores (ver §3.4).
+  - **Modo legado** (`per_device`): `{prefix}/devices/{device_id_sanitizado}/sms/inbox_delivery` — até N publicações (uma por dispositivo activo sem filtro de modem compatível).
 
-**Dispositivo externo:** deve publicar em `status` e `inbox`, e subscrever `send` e `inbox/ack` (para receber pedidos de envio e confirmações de leitura da inbox).
+- Telemetria (não solicitada): `{prefix}/modems/{modem_index}/status/telemetry` com `event=bootstrap` após cada ligação ao broker bem sucedida, e `event=state_change` quando `mmcli` reporta dados alterados (ver `MQTT_MODEM_STATUS_POLL_INTERVAL_SEC`).
+- Pedido sob demanda: `{prefix}/modems/{modem_index}/status/response` como resposta aos pedidos §3.5.
+
+**Dispositivo externo:** deve publicar em `status` e `inbox`, e subscrever `send`, `inbox/ack`. Para receber notificações de SMS espelhadas a partir do modem, subscreve `…/sms/inbox_delivery` no modo `per_device` ou `…/modems/{N}/sms/inbox_delivery` no modo `broadcast`.
 
 ---
 
@@ -254,15 +270,81 @@ mosquitto_sub -h localhost -p 1883 \
   -t "hidishelink_external/devices/351913000001/sms/send" -v
 ```
 
+Os pedidos são publicados quando `MQTT_PUBLISH_SEND_REQUEST=true` (defeito) após o envio físico pelo modem ser processado pela API (`POST /api/v1/sms/send/`).
+
+### 3.4 Push de inbox vinda do modem (`…/sms/inbox_delivery`)
+
+Com `MQTT_PUBLISH_MODEM_INBOX=true` (no **Docker Compose** oficial isto vai por defeito para o contentor via `environment`), o gateway publica sempre que uma linha modem é espelhada na inbox (criação ou preenchimento de corpo até então em branco). Procure nos logs `MQTT modem inbox_delivery (broadcast)` ou `(per_device)`.
+
+**Modo `broadcast` (defeito):** `{prefix}/modems/{modem_index}/sms/inbox_delivery` — payload JSON típico: `message_id` (`mmcli_<pk>` da `InboundSms`), `sender`, `body`, `received_at`, `modem_index`, e opcionalmente `mirrored_device_ids` / `device_message_ids` (`mmcli_<pk>_dev_<ExternalDevice.pk>` por dispositivo).
+
+**Modo `per_device`:** `{prefix}/devices/{id_sanitizado}/sms/inbox_delivery`, com `message_id`=`mmcli_<pk>_dev_<ExternalDevice.pk>`.
+
+Para desativar neste servidor: no `.env` ou Compose defina `MQTT_PUBLISH_MODEM_INBOX=false`.
+
+```bash
+mosquitto_sub -h mqtt.hidishe.com -p 43827 \
+  -u utilizador_broker \
+  -P palavra_passe \
+  -t "hidishelink_external/modems/0/sms/inbox_delivery" -v
+```
+
+Legado (`per_device`):
+
+```bash
+mosquitto_sub -h mqtt.hidishe.com -p 43827 \
+  -u utilizador_broker \
+  -P palavra_passe \
+  -t "hidishelink_external/devices/351913000001/sms/inbox_delivery" -v
+```
+
+### 3.5 Estado completo do modem (pedido / resposta)
+
+Com `MQTT_MODEM_STATUS_AUTO_PUBLISH=true` (**defeito**), assim que o gateway se liga ao broker publica também (por modem enumerado pelo `mmcli -L`) em:
+
+```text
+{prefix}/modems/{modem_index}/status/telemetry
+```
+
+Corpo igual ao formato abaixo, com campo extra `event`: `bootstrap` na ligação/reconexão. Se `MQTT_MODEM_STATUS_POLL_INTERVAL_SEC` é maior que zero, esse tópico é voltado a publicar quando um hash SHA-256 do `mmcli_flat` deixa de coincidir com o último ciclo (`event`: `state_change`).
+
+---
+
+Com `MQTT_MODEM_STATUS_SUBSCRIBE=true` (**defeito**), pode pedir um snapshot `mmcli` publicando um corpo JSON vazio `{}` ou outro objeto no tópico:
+
+```text
+{prefix}/modems/{modem_index}/status/request
+```
+
+O gateway corre `mmcli` fora da thread MQTT e publica uma resposta em:
+
+```text
+{prefix}/modems/{modem_index}/status/response
+```
+
+Exemplo rápido (modificar host/credenciais):
+
+```bash
+mosquitto_pub -h localhost -p 1883 \
+  -t "hidishelink_external/modems/0/status/request" -m '{}' -q 1
+
+mosquitto_sub -h localhost -p 1883 \
+  -t "hidishelink_external/modems/0/status/response" -C 1 -v
+```
+
 ---
 
 ## 4. Comando de gestão Django — cliente MQTT do gateway
 
-Corre o processo que liga ao broker e trata `status` / `inbox`:
+Corre o processo que liga ao broker e trata `status` / `inbox` dos dispositivos externos, pedidos de snapshot modem (`modems/+/status/request` → `…/status/response`) e telemetria automática (`…/status/telemetry` quando `MQTT_MODEM_STATUS_AUTO_PUBLISH` está activo):
 
 ```bash
 python manage.py run_mqtt_gateway
 ```
+
+No **Docker Compose** oficial, esse comando é iniciado automaticamente quando `RUN_MQTT_GATEWAY=true` na entrypoint (`docker-compose.yml` exporta esta variável ao contentor).
+
+As publicações geradas pela **API HTTP** (tópico `…/sms/send`) e opcionalmente por **SMS recebida no modem** (nos tópicos `…/modems/{N}/sms/inbox_delivery` em modo broadcast ou `…/devices/{id}/sms/inbox_delivery` em modo `per_device`) usam ligações **efémeras** por pedido nos workers Gunicorn; continuam disponíveis mesmo que o cliente em background falhe iniciar até o broker estar alcançável — ver timeouts em `MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC` nos logs.
 
 ---
 

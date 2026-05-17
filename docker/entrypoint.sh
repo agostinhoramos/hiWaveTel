@@ -317,6 +317,11 @@ if truthy "${RUN_SMS_WATCHER:-}"; then
   echo "SMS watcher (modem_index=${MODEM_MMCLI_INDEX}) in background."
 fi
 
+if truthy "${RUN_MQTT_GATEWAY:-}"; then
+  python manage.py run_mqtt_gateway &
+  echo "MQTT gateway (run_mqtt_gateway) in background."
+fi
+
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"
 exec gunicorn config.wsgi:application \
   --bind "0.0.0.0:${HIWAVE_PORT}" \

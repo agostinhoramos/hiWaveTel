@@ -32,6 +32,18 @@ def validated_log_level_name(name: str, default: str = 'INFO') -> str:
     return default
 
 
+def mqtt_credential_strip(value: str) -> str:
+    """Strip whitespace and stray quotes from MQTT env vars (docker/.env tolerant)."""
+    return value.strip().strip('"').strip("'")
+
+
+def truthy_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, '').strip().lower()
+    if not raw:
+        return default
+    return raw in ('1', 'true', 'yes', 'on')
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 INSTALLED_APPS = [
@@ -80,10 +92,41 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 _sqlite_override = os.environ.get('SQLITE_DB_PATH', '').strip()
 _db_name = _sqlite_override or (BASE_DIR / 'db.sqlite3')
+
+_sqlite_busy_raw = os.environ.get('SQLITE_BUSY_TIMEOUT_SEC', '30').strip()
+try:
+    SQLITE_BUSY_TIMEOUT_SEC = float(_sqlite_busy_raw) if _sqlite_busy_raw else 30.0
+except ValueError:
+    SQLITE_BUSY_TIMEOUT_SEC = 30.0
+if SQLITE_BUSY_TIMEOUT_SEC <= 0:
+    SQLITE_BUSY_TIMEOUT_SEC = 30.0
+
+SQLITE_LOCKED_RETRY_COUNT = positive_int_env('SQLITE_LOCKED_RETRY_COUNT', 15)
+if SQLITE_LOCKED_RETRY_COUNT <= 0:
+    SQLITE_LOCKED_RETRY_COUNT = 15
+
+_sqlite_backoff_raw = os.environ.get('SQLITE_LOCKED_RETRY_BACKOFF_SEC', '0.02').strip()
+try:
+    SQLITE_LOCKED_RETRY_BACKOFF_SEC = float(_sqlite_backoff_raw) if _sqlite_backoff_raw else 0.02
+except ValueError:
+    SQLITE_LOCKED_RETRY_BACKOFF_SEC = 0.02
+if SQLITE_LOCKED_RETRY_BACKOFF_SEC <= 0:
+    SQLITE_LOCKED_RETRY_BACKOFF_SEC = 0.02
+
+_sqlite_options: dict = {'timeout': SQLITE_BUSY_TIMEOUT_SEC}
+_sqlite_pragmas = []
+if truthy_env('SQLITE_INIT_WAL', default=True):
+    _sqlite_pragmas.append('PRAGMA journal_mode=WAL')
+if truthy_env('SQLITE_SYNCHRONOUS_NORMAL', default=True):
+    _sqlite_pragmas.append('PRAGMA synchronous=NORMAL')
+if _sqlite_pragmas:
+    _sqlite_options['init_command'] = '; '.join(_sqlite_pragmas)
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': str(_db_name),
+        'OPTIONS': dict(_sqlite_options),
     },
 }
 
@@ -111,15 +154,50 @@ except ValueError:
     HIWAVE_MMCLI_HEALTH_TIMEOUT = 15.0
 
 # MQTT settings for external device gateway (broker connection)
-MQTT_BROKER_URL = os.environ.get('MQTT_BROKER_URL', 'localhost')
+MQTT_BROKER_URL = os.environ.get('MQTT_BROKER_URL', 'localhost').strip()
 MQTT_PORT = positive_int_env('MQTT_PORT', 1883)
-MQTT_USER = os.environ.get('MQTT_USER', '')
-MQTT_PASS = os.environ.get('MQTT_PASS', '')
-MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'hiwavetel_gateway')
+MQTT_USER = mqtt_credential_strip(os.environ.get('MQTT_USER', '') or '')
+MQTT_PASS = mqtt_credential_strip(os.environ.get('MQTT_PASS', '') or '')
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'hiwavetel_gateway').strip()
 MQTT_KEEPALIVE = positive_int_env('MQTT_KEEPALIVE', 60)
 MQTT_QOS = positive_int_env('MQTT_QOS', 1)
 MQTT_CLEAN_SESSION = os.environ.get('MQTT_CLEAN_SESSION', 'false').lower() == 'true'
-MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_external')
+MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_external').strip()
+MQTT_PUBLISH_SEND_REQUEST = truthy_env('MQTT_PUBLISH_SEND_REQUEST', default=True)
+MQTT_PUBLISH_MODEM_INBOX = truthy_env('MQTT_PUBLISH_MODEM_INBOX', default=False)
+_ephemeral_publish_timeout_raw = os.environ.get('MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC', '').strip()
+try:
+    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = (
+        float(_ephemeral_publish_timeout_raw) if _ephemeral_publish_timeout_raw else 15.0
+    )
+except ValueError:
+    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = 15.0
+if MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC <= 0:
+    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = 15.0
+
+_mqtt_modem_inbox_mode_raw = os.environ.get('MQTT_MODEM_INBOX_DELIVERY_MODE', 'broadcast').strip().lower()
+MQTT_MODEM_INBOX_DELIVERY_MODE = 'per_device' if _mqtt_modem_inbox_mode_raw == 'per_device' else 'broadcast'
+MQTT_MODEM_STATUS_SUBSCRIBE = truthy_env('MQTT_MODEM_STATUS_SUBSCRIBE', default=True)
+_modem_status_timeout_raw = os.environ.get('MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC', '').strip()
+try:
+    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = (
+        float(_modem_status_timeout_raw) if _modem_status_timeout_raw else 45.0
+    )
+except ValueError:
+    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = 45.0
+if MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC <= 0:
+    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = 45.0
+
+MQTT_MODEM_STATUS_AUTO_PUBLISH = truthy_env('MQTT_MODEM_STATUS_AUTO_PUBLISH', default=True)
+_modem_status_poll_interval_raw = os.environ.get('MQTT_MODEM_STATUS_POLL_INTERVAL_SEC', '').strip()
+try:
+    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = (
+        float(_modem_status_poll_interval_raw) if _modem_status_poll_interval_raw else 30.0
+    )
+except ValueError:
+    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
+if MQTT_MODEM_STATUS_POLL_INTERVAL_SEC < 0:
+    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
 
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',

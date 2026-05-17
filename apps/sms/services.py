@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import random
+import threading
+import time
 
-from django.db import transaction
+from django.conf import settings
+from django.db import close_old_connections, transaction
+from django.db.utils import OperationalError
 
 from .mmcli_client import (
     MMCLIClient,
@@ -19,6 +25,10 @@ from .models import InboundSms, OutboundSms
 
 _LOGGER = logging.getLogger(__name__)
 
+# Same-process SQLite writers (e.g. several ``SmsProcessingQueue`` threads) contend with Django ORM;
+# serialize here so inbound SMS rows are not raced with ``OperationalError: database is locked``.
+_sqlite_inbound_persist_lock = threading.Lock()
+
 
 def format_public_mmcli_error(exc: MmcliError) -> str:
     """Return a short, client-safe description (no stderr dumps).
@@ -32,6 +42,11 @@ def format_public_mmcli_error(exc: MmcliError) -> str:
         combined = ': '.join(p for p in (base, first_line) if p)
         return combined[:200]
     return base[:200]
+
+
+def _looks_sqlite_concurrency_error(exc: BaseException) -> bool:
+    lowered = str(exc).lower()
+    return 'locked' in lowered or 'busy' in lowered
 
 
 def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | None = None) -> InboundSms:
@@ -51,8 +66,43 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
         'modem_timestamp_raw': extract_timestamp(raw),
     }
 
-    with transaction.atomic():
-        obj, created = InboundSms.objects.get_or_create(mm_path=mm_path, defaults=defaults)
+    from django.db import connection
+
+    lock_ctx = _sqlite_inbound_persist_lock if connection.vendor == 'sqlite' else contextlib.nullcontext()
+    retries = int(getattr(settings, 'SQLITE_LOCKED_RETRY_COUNT', 15))
+    backoff_sec = float(getattr(settings, 'SQLITE_LOCKED_RETRY_BACKOFF_SEC', 0.02))
+
+    obj: InboundSms | None = None
+    created = False
+    last_lock_exc: OperationalError | None = None
+
+    with lock_ctx:
+        for attempt in range(retries):
+            try:
+                with transaction.atomic():
+                    obj, created = InboundSms.objects.get_or_create(mm_path=mm_path, defaults=defaults)
+                break
+            except OperationalError as exc:
+                last_lock_exc = exc
+                if not _looks_sqlite_concurrency_error(exc) or attempt >= retries - 1:
+                    raise
+                delay = backoff_sec * (2**attempt) + random.random() * 0.02
+                _LOGGER.warning(
+                    'SQLite busy persisting inbound (attempt %s/%s, mm_path=%s): %s; retry %.3fs',
+                    attempt + 1,
+                    retries,
+                    mm_path,
+                    exc,
+                    delay,
+                )
+                close_old_connections()
+                time.sleep(delay)
+        else:
+            if last_lock_exc is not None:
+                raise last_lock_exc
+            raise RuntimeError('persist_inbound_sms exhausted retries without OperationalError')
+
+    assert obj is not None
 
     if created:
         text_preview = defaults['text'][:50] + '...' if len(defaults['text']) > 50 else defaults['text']
