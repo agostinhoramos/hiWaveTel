@@ -29,14 +29,15 @@ services:
       DJANGO_LOG_FILE: "${DJANGO_LOG_FILE:-hiwavetel-api.log}"
       APPLICATION_LOG_LEVEL: "${APPLICATION_LOG_LEVEL:-INFO}"
       HIWAVE_PORT: "${HIWAVE_PORT:-8000}"
-      SQLITE_DB_PATH: /data/db.sqlite3
-      RUN_SMS_WATCHER: "${RUN_SMS_WATCHER:-false}"
+      # Bind-mount project root as /app/host so db.sqlite3 can be created automatically (file bind-mounts fail when missing).
+      SQLITE_DB_PATH: "${SQLITE_DB_PATH:-/app/host/db.sqlite3}"
+      RUN_SMS_WATCHER: "${RUN_SMS_WATCHER:-true}"
       MODEM_TTY_PRIMARY: "${MODEM_TTY_PRIMARY:-/dev/ttyUSB2}"
       MODEM_TTY_SECONDARY: "${MODEM_TTY_SECONDARY:-/dev/ttyUSB3}"
       MODEM_LTE_INTERFACE: "${MODEM_LTE_INTERFACE:-wwan0}"
       MODEM_STRICT_WWAN_CHECK: "${MODEM_STRICT_WWAN_CHECK:-false}"
-      MODEM_ENUMERATION_WAIT_SEC: "${MODEM_ENUMERATION_WAIT_SEC:-30}"
-      MODEM_ENABLE_WAIT_SEC: "${MODEM_ENABLE_WAIT_SEC:-20}"
+      MODEM_ENUMERATION_WAIT_SEC: "${MODEM_ENUMERATION_WAIT_SEC:-60}"
+      MODEM_ENABLE_WAIT_SEC: "${MODEM_ENABLE_WAIT_SEC:-45}"
       MMCLI_SCAN_TRIES: "${MMCLI_SCAN_TRIES:-1}"
       MMCLI_SCAN_SLEEP_SEC: "${MMCLI_SCAN_SLEEP_SEC:-1}"
       MODEM_QMI_DEVICE: "${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}"
@@ -44,9 +45,12 @@ services:
       # When AUTO_DETECT_MMCLI_INDEX=true and a modem was found, the entrypoint sets MODEM_MMCLI_INDEX from mmcli -L (Modem/N path).
       AUTO_DETECT_MMCLI_INDEX: "${AUTO_DETECT_MMCLI_INDEX:-true}"
       MODEM_MMCLI_INDEX: "${MODEM_MMCLI_INDEX:-0}"
+      MQTT_EXTERNAL_TOPIC_PREFIX: "${MQTT_EXTERNAL_TOPIC_PREFIX:-hidishelink_external}"
+      SMS_QUEUE_WORKERS: "${SMS_QUEUE_WORKERS:-3}"
+      SMS_QUEUE_MAX_SIZE: "${SMS_QUEUE_MAX_SIZE:-1000}"
     volumes:
-      - hiwavetel_sqlite_data:/data
-      - hiwavetel_logs:/app/logs
+      - ..:/app/host:rw
+      - ../logs:/app/logs
       - /sys/bus/usb:/sys/bus/usb:ro
     # ttyUSB2: AT SMS; ttyUSB3: AT backup; cdc-wdm0: QMI (required for QMI ModemManager).
     devices:
@@ -61,7 +65,3 @@ services:
       retries: 3
       start_period: 300s
     restart: unless-stopped
-
-volumes:
-  hiwavetel_sqlite_data:
-  hiwavetel_logs:

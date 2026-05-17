@@ -9,6 +9,30 @@ truthy() {
   esac
 }
 
+# Docker file bind-mounts create a directory when the host file is missing; recover and create the DB file.
+ensure_sqlite_file() {
+  local db_path="${1:-}"
+  [[ -n "${db_path}" ]] || return 0
+
+  local parent
+  parent="$(dirname "${db_path}")"
+  mkdir -p "${parent}"
+
+  if [[ -d "${db_path}" ]]; then
+    if find "${db_path}" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+      echo "SQLITE_DB_PATH is a non-empty directory: ${db_path}" >&2
+      exit 1
+    fi
+    rmdir "${db_path}"
+    echo "Removed empty SQLite directory (Docker bind-mount artefact): ${db_path}"
+  fi
+
+  if [[ ! -f "${db_path}" ]]; then
+    touch "${db_path}"
+    echo "Created SQLite database: ${db_path}"
+  fi
+}
+
 # True when SIM reports PIN lock per mmcli (skip unnecessary --pin when already usable).
 _sim_is_locked() {
   local sim_path="$1"
@@ -263,9 +287,7 @@ elif [[ "${FOUND}" == "1" && -z "${PIN}" ]] && [[ -n "${SIM_EXPLICIT}" ]]; then
   echo "SIM_PATH set without DEVICE_PIN_CODE: no unlock attempt (normal if SIM is not PIN-locked)." >&2
 fi
 
-if [[ -n "${SQLITE_DB_PATH:-}" ]]; then
-  mkdir -p "$(dirname "${SQLITE_DB_PATH}")"
-fi
+ensure_sqlite_file "${SQLITE_DB_PATH:-}"
 
 # Ensure log directory exists before Django boots (paired with SQLite path above).
 mkdir -p "${DJANGO_LOG_DIR:-/app/logs}"

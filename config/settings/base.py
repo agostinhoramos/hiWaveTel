@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'drf_spectacular',
     'apps.sms',
+    'apps.external_device',
 ]
 
 MIDDLEWARE = [
@@ -109,6 +110,17 @@ try:
 except ValueError:
     HIWAVE_MMCLI_HEALTH_TIMEOUT = 15.0
 
+# MQTT settings for external device gateway (broker connection)
+MQTT_BROKER_URL = os.environ.get('MQTT_BROKER_URL', 'localhost')
+MQTT_PORT = positive_int_env('MQTT_PORT', 1883)
+MQTT_USER = os.environ.get('MQTT_USER', '')
+MQTT_PASS = os.environ.get('MQTT_PASS', '')
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'hiwavetel_gateway')
+MQTT_KEEPALIVE = positive_int_env('MQTT_KEEPALIVE', 60)
+MQTT_QOS = positive_int_env('MQTT_QOS', 1)
+MQTT_CLEAN_SESSION = os.environ.get('MQTT_CLEAN_SESSION', 'false').lower() == 'true'
+MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_external')
+
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_PERMISSION_CLASSES': [
@@ -133,20 +145,24 @@ REST_FRAMEWORK = {
 SPECTACULAR_SETTINGS = {
     'TITLE': 'hiWaveTel API',
     'DESCRIPTION': (
-        'SMS via ModemManager (mmcli); inbound persisted by D-Bus watcher. '
-        'Obtain JWT tokens at `/api/auth/token/` and send `Authorization: Bearer <access>`. '
-        'OpenAPI schema `/api/schema/` and Swagger UI `/api/docs/` are public; authenticated '
-        '`/api/` SMS routes still require JWT.'
+        'SMS via ModemManager (mmcli); inbound persisted by D-Bus watcher.\n\n'
+        '- **Modem API** (`/api/sms/…`): JWT from `/api/auth/token/` — in Swagger authorize '
+        'scheme **jwtAuth** (Bearer).\n'
+        '- **External devices** (`/api/v1/…`): API key — in Swagger authorize scheme '
+        '**apiKeyAuth** (header `X-API-Key`). Bearer JWT is not accepted on these routes.\n\n'
+        'OpenAPI `/api/schema/` and Swagger UI `/api/docs/` are public; try endpoints still '
+        'require the correct auth per route.'
     ),
     'VERSION': '1.0.0',
-    'SECURITY_DEFINITIONS': {
-        'bearerAuth': {
-            'type': 'http',
-            'scheme': 'bearer',
-            'bearerFormat': 'JWT',
-        },
+    # Do not set SECURITY globally: it was appended to every operation and forced Bearer on
+    # `/api/v1/*` while the server expects X-API-Key. Per-endpoint security comes from auth
+    # classes (jwtAuth / apiKeyAuth via OpenApiAuthenticationExtension).
+    'SECURITY': [],
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        # Keep Authorize dialog values after refresh (localStorage).
+        'persistAuthorization': True,
     },
-    'SECURITY': [{'bearerAuth': []}],
 }
 
 # Persisted logs (single dictConfig — see docs/logging-file-contract.md).
@@ -157,9 +173,25 @@ os.makedirs(DJANGO_LOG_DIR, mode=0o755, exist_ok=True)
 
 _LOG_FILE_PATH = str(Path(DJANGO_LOG_DIR) / DJANGO_LOG_FILE)
 
+class HealthProbeFilter(logging.Filter):
+    """Suppress 5xx ERROR logs from health endpoint during startup."""
+    def filter(self, record):
+        msg = record.getMessage()
+        # Suppress ERROR logs for health endpoint 503 responses
+        if record.levelno >= logging.ERROR and '/api/health/' in msg:
+            return False
+        return True
+
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+    'filters': {
+        'health_probe_filter': {
+            '()': 'django.utils.log.CallbackFilter',
+            'callback': lambda record: not (record.levelno >= logging.ERROR and '/api/health/' in record.getMessage()),
+        },
+    },
     'formatters': {
         'hiwavetel_file': {
             'format': '%(asctime)s - %(levelname)s - %(message)s',
@@ -174,10 +206,30 @@ LOGGING = {
             'interval': 1,
             'backupCount': 7,
             'formatter': 'hiwavetel_file',
+            'filters': ['health_probe_filter'],
+        },
+        'console': {
+            'level': APPLICATION_LOG_LEVEL,
+            'class': 'logging.StreamHandler',
+            'stream': 'ext://sys.stdout',
+            'formatter': 'hiwavetel_file',
+            'filters': ['health_probe_filter'],
+        },
+    },
+    'loggers': {
+        'django.request': {
+            'handlers': ['file_rotating', 'console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'django.server': {
+            'handlers': ['file_rotating', 'console'],
+            'level': 'WARNING',
+            'propagate': False,
         },
     },
     'root': {
-        'handlers': ['file_rotating'],
+        'handlers': ['file_rotating', 'console'],
         'level': APPLICATION_LOG_LEVEL,
     },
 }

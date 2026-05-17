@@ -54,6 +54,23 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     with transaction.atomic():
         obj, created = InboundSms.objects.get_or_create(mm_path=mm_path, defaults=defaults)
 
+    if created:
+        text_preview = defaults['text'][:50] + '...' if len(defaults['text']) > 50 else defaults['text']
+        _LOGGER.info(
+            'SMS recebida: from=%s modem_index=%s texto=%s mm_path=%s',
+            defaults['from_number'] or '(unknown)',
+            modem_index,
+            text_preview,
+            mm_path,
+        )
+        if not (defaults['text'] or '').strip():
+            _LOGGER.debug(
+                'InboundSms created with empty texto mm_path=%s mm_state=%s raw_keys_sample=%s',
+                mm_path,
+                defaults['mm_state'] or '(unset)',
+                sorted(raw.keys())[:12],
+            )
+
     if not created:
         patched = {}
         for field_name, desired in defaults.items():
@@ -61,6 +78,7 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
             if isinstance(current, str) and not current.strip() and isinstance(desired, str) and desired.strip():
                 patched[field_name] = desired
         if patched:
+            _LOGGER.debug('InboundSms pk=%s updated fields: %s', obj.pk, list(patched.keys()))
             for key, val in patched.items():
                 setattr(obj, key, val)
             obj.save(update_fields=list(patched.keys()))

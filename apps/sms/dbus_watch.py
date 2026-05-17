@@ -10,17 +10,38 @@ import time
 
 from dbus_next import BusType
 from dbus_next.aio import MessageBus
-from dbus_next.errors import DBusError
+from dbus_next.errors import DBusError, InterfaceNotFoundError
+import dbus_next.message_bus as _dbus_mb
 
 from django.db import DatabaseError, IntegrityError
 
 from .mmcli_client import MMCLIClient, MmcliError
+from .queue_processor import get_sms_queue
 from .services import persist_inbound_sms
 
 _LOGGER = logging.getLogger(__name__)
 
 _MM_BUS_NAME = 'org.freedesktop.ModemManager1'
 _MM_MODEM_INTF = 'org.freedesktop.ModemManager1.Modem.Messaging'
+
+# Configuration for modem interface readiness retry
+_MODEM_INTF_WAIT_RETRIES = int(os.environ.get('MODEM_INTF_WAIT_RETRIES', '12'))
+_MODEM_INTF_WAIT_SEC = float(os.environ.get('MODEM_INTF_WAIT_SEC', '3.0'))
+
+# Monkey-patch dbus-next to handle None msg in add_match_notify (known bug in dbus-next)
+_original_add_match_notify = None
+
+def _safe_add_match_notify(self_bus, msg, err):  # noqa: ANN001
+    """Guard against msg=None in dbus-next add_match_notify callback."""
+    if msg is None:
+        return
+    return _original_add_match_notify(self_bus, msg, err)
+
+# Apply patch only once at module import
+_orig = getattr(_dbus_mb.BaseMessageBus, '_add_match_notify', None)
+if _orig is not None:
+    _original_add_match_notify = _orig
+    _dbus_mb.BaseMessageBus._add_match_notify = _safe_add_match_notify
 
 
 def modem_object_path(modem_index: int) -> str:
@@ -79,6 +100,74 @@ async def _persist_async(mm_path: str, modem_index: int) -> None:
     await loop.run_in_executor(None, _persist)
 
 
+def _make_on_added_callback(modem_index: int):
+    """Return the Messaging.Added signal handler for the given modem index.
+
+    The ModemManager D-Bus signal signature is: Added(o path, b received)
+      - path:     SMS object path e.g. /org/freedesktop/ModemManager1/SMS/N
+      - received: True when the SMS just arrived over-the-air,
+                  False when loaded from modem storage.
+    dbus-next calls this as callback(path, received) — NOT (data, error).
+    """
+    def _on_added(sms_path: str, received: bool = False) -> None:
+        """Synchronous callback for D-Bus Messaging.Added signal."""
+        _LOGGER.info(
+            'D-Bus Messaging.Added: sms_path=%s received=%s modem_index=%s',
+            sms_path, received, modem_index,
+        )
+
+        try:
+            sms_queue = get_sms_queue()
+            success = sms_queue.enqueue(sms_path, modem_index)
+
+            if success:
+                _LOGGER.info('SMS enqueued: sms_path=%s modem_index=%s', sms_path, modem_index)
+            else:
+                _LOGGER.error('Failed to enqueue SMS (queue full): %s', sms_path)
+                # Fallback: persist synchronously as last resort
+                try:
+                    persist_inbound_sms(sms_path, modem_index, None)
+                except Exception as fallback_exc:
+                    _LOGGER.exception('Fallback persist also failed for %s: %s', sms_path, fallback_exc)
+        except Exception as exc:
+            _LOGGER.exception('Failed to enqueue SMS %s: %s', sms_path, exc)
+
+    return _on_added
+
+
+def _try_enable_modem(modem_index: int) -> None:
+    """Attempt to enable the modem via mmcli if it appears disabled.
+
+    Called from a thread executor so it doesn't block the asyncio event loop.
+    Failures are logged but not raised — the caller continues retrying.
+    """
+    import subprocess as _sp
+    mmcli_path = os.environ.get('MMCLI_PATH', 'mmcli')
+    try:
+        state_cp = _sp.run(
+            [mmcli_path, '-m', str(modem_index)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if 'state: disabled' in state_cp.stdout or 'state: disabled' in state_cp.stderr:
+            _LOGGER.info('Modem %s is disabled — attempting mmcli --enable ...', modem_index)
+            en_cp = _sp.run(
+                [mmcli_path, '-m', str(modem_index), '--enable'],
+                capture_output=True, text=True, timeout=30,
+            )
+            if en_cp.returncode == 0:
+                _LOGGER.info('mmcli --enable modem %s succeeded', modem_index)
+            else:
+                _LOGGER.warning(
+                    'mmcli --enable modem %s failed (rc=%s): %s',
+                    modem_index, en_cp.returncode,
+                    (en_cp.stderr or en_cp.stdout or '').strip()[:200],
+                )
+        else:
+            _LOGGER.debug('Modem %s state check: not disabled; skipping enable attempt', modem_index)
+    except Exception as exc:
+        _LOGGER.warning('_try_enable_modem(%s) error: %s', modem_index, exc)
+
+
 async def run_modem_added_listener(
     modem_index: int,
     reconnect_after: float,
@@ -93,17 +182,33 @@ async def run_modem_added_listener(
         bus: MessageBus | None = None
         try:
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            introspection = await bus.introspect(_MM_BUS_NAME, path)
-            proxy = bus.get_proxy_object(_MM_BUS_NAME, path, introspection)
-            messaging = proxy.get_interface(_MM_MODEM_INTF)
-
-            async def _on_added(sms_path: str) -> None:
+            
+            # Retry loop: modem interface may not be ready immediately at startup.
+            # If the modem is disabled, Modem.Messaging does not appear — try to
+            # enable it once halfway through the retries.
+            messaging = None
+            _enable_attempted = False
+            for attempt in range(_MODEM_INTF_WAIT_RETRIES):
+                introspection = await bus.introspect(_MM_BUS_NAME, path)
+                proxy = bus.get_proxy_object(_MM_BUS_NAME, path, introspection)
                 try:
-                    await _persist_async(sms_path, modem_index)
-                except Exception as exc:  # noqa: BLE071
-                    _LOGGER.exception('Persist inbound %s failed: %s', sms_path, exc)
+                    messaging = proxy.get_interface(_MM_MODEM_INTF)
+                    break
+                except InterfaceNotFoundError:
+                    if attempt + 1 >= _MODEM_INTF_WAIT_RETRIES:
+                        raise
+                    _LOGGER.warning(
+                        'Modem.Messaging not ready yet on modem %s (attempt %d/%d), retry in %.1fs',
+                        modem_index, attempt + 1, _MODEM_INTF_WAIT_RETRIES, _MODEM_INTF_WAIT_SEC,
+                    )
+                    # Halfway through retries, try enabling the modem in case it is disabled.
+                    if not _enable_attempted and attempt + 1 >= _MODEM_INTF_WAIT_RETRIES // 2:
+                        _enable_attempted = True
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, _try_enable_modem, modem_index)
+                    await asyncio.sleep(_MODEM_INTF_WAIT_SEC)
 
-            messaging.on_added(_on_added)
+            messaging.on_added(_make_on_added_callback(modem_index))
             _LOGGER.info('Listening on %s Messaging.Added (system bus)', path)
 
             # Listener attached first; snapshot uses get_or_create and won't duplicate dangerously.
@@ -118,6 +223,8 @@ async def run_modem_added_listener(
 
         except DBusError as exc:
             _LOGGER.warning('SMS watcher D-Bus error (%s): %s', modem_index, exc)
+        except InterfaceNotFoundError as exc:
+            _LOGGER.warning('SMS watcher: Modem.Messaging unavailable on modem %s after all retries: %s', modem_index, exc)
         except OSError as exc:
             _LOGGER.warning('SMS watcher OS level failure (%s): %s', modem_index, exc)
         except Exception as exc:  # noqa: BLE071

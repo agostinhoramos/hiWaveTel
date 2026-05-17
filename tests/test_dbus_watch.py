@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,3 +48,145 @@ def test_persist_async_runs(monkeypatch):
 
     asyncio.run(dbus_watch._persist_async('/p', 9))
     assert calls == [('/p', 9)]
+
+
+def test_on_added_enqueues_sms_when_received_true():
+    """D-Bus calls _on_added(path, True) for a freshly received SMS.
+
+    ModemManager Messaging.Added signal: Added(o path, b received).
+    received=True means the SMS just arrived over-the-air.
+    This is the normal case and MUST be processed, not dropped.
+    """
+    mock_queue = MagicMock()
+    mock_queue.enqueue.return_value = True
+
+    with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
+        callback = dbus_watch._make_on_added_callback(modem_index=0)
+        # dbus-next passes (path, received=True) for incoming SMS
+        callback('/org/freedesktop/ModemManager1/SMS/123', True)
+
+    mock_queue.enqueue.assert_called_once_with('/org/freedesktop/ModemManager1/SMS/123', 0)
+
+
+def test_on_added_enqueues_sms_when_received_false():
+    """received=False means SMS loaded from storage (not just received).
+
+    Still must be processed (e.g. startup snapshot path via D-Bus).
+    """
+    mock_queue = MagicMock()
+    mock_queue.enqueue.return_value = True
+
+    with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
+        callback = dbus_watch._make_on_added_callback(modem_index=2)
+        callback('/org/freedesktop/ModemManager1/SMS/77', False)
+
+    mock_queue.enqueue.assert_called_once_with('/org/freedesktop/ModemManager1/SMS/77', 2)
+
+
+def test_on_added_fallback_when_queue_full():
+    """When enqueue returns False (queue full), falls back to direct persist."""
+    mock_queue = MagicMock()
+    mock_queue.enqueue.return_value = False
+
+    with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
+        with patch('apps.sms.dbus_watch.persist_inbound_sms') as mock_persist:
+            callback = dbus_watch._make_on_added_callback(modem_index=1)
+            callback('/org/freedesktop/ModemManager1/SMS/456', True)
+
+    mock_queue.enqueue.assert_called_once()
+    mock_persist.assert_called_once_with('/org/freedesktop/ModemManager1/SMS/456', 1, None)
+
+
+def test_on_added_does_not_raise_on_enqueue_exception():
+    """Exceptions inside enqueue must not propagate out of the signal handler."""
+    mock_queue = MagicMock()
+    mock_queue.enqueue.side_effect = RuntimeError('Queue exploded')
+
+    with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
+        callback = dbus_watch._make_on_added_callback(modem_index=0)
+        # Must not raise
+        callback('/org/freedesktop/ModemManager1/SMS/999', True)
+
+    mock_queue.enqueue.assert_called_once()
+
+
+def test_try_enable_modem_disabled_state_succeeds():
+    """Should detect disabled modem and run --enable successfully."""
+    state_result = SimpleNamespace(
+        returncode=0,
+        stdout='state: disabled',
+        stderr=''
+    )
+    enable_result = SimpleNamespace(
+        returncode=0,
+        stdout='successfully enabled',
+        stderr=''
+    )
+    
+    with patch('subprocess.run', side_effect=[state_result, enable_result]) as mock_run:
+        dbus_watch._try_enable_modem(modem_index=0)
+    
+    assert mock_run.call_count == 2
+    # First call checks state
+    assert mock_run.call_args_list[0][0][0] == ['mmcli', '-m', '0']
+    # Second call enables
+    assert mock_run.call_args_list[1][0][0] == ['mmcli', '-m', '0', '--enable']
+
+
+def test_try_enable_modem_disabled_state_enable_fails():
+    """Should log warning when --enable fails but not raise exception."""
+    state_result = SimpleNamespace(
+        returncode=0,
+        stdout='state: disabled',
+        stderr=''
+    )
+    enable_result = SimpleNamespace(
+        returncode=1,
+        stdout='',
+        stderr='enable failed: error'
+    )
+    
+    with patch('subprocess.run', side_effect=[state_result, enable_result]) as mock_run:
+        # Should not raise exception
+        dbus_watch._try_enable_modem(modem_index=0)
+    
+    assert mock_run.call_count == 2
+
+
+def test_try_enable_modem_not_disabled():
+    """Should skip enable when modem is not disabled."""
+    state_result = SimpleNamespace(
+        returncode=0,
+        stdout='state: enabled',
+        stderr=''
+    )
+    
+    with patch('subprocess.run', return_value=state_result) as mock_run:
+        dbus_watch._try_enable_modem(modem_index=0)
+    
+    # Only state check, no enable call
+    assert mock_run.call_count == 1
+    assert mock_run.call_args[0][0] == ['mmcli', '-m', '0']
+
+
+def test_try_enable_modem_exception_does_not_raise():
+    """Should catch and log exceptions without raising."""
+    with patch('subprocess.run', side_effect=Exception('mmcli command failed')):
+        # Should not raise exception
+        dbus_watch._try_enable_modem(modem_index=0)
+
+
+def test_try_enable_modem_custom_mmcli_path():
+    """Should respect MMCLI_PATH environment variable."""
+    state_result = SimpleNamespace(
+        returncode=0,
+        stdout='state: enabled',
+        stderr=''
+    )
+    
+    with patch('subprocess.run', return_value=state_result) as mock_run:
+        with patch.dict('os.environ', {'MMCLI_PATH': '/custom/path/mmcli'}):
+            dbus_watch._try_enable_modem(modem_index=3)
+    
+    assert mock_run.call_count == 1
+    assert mock_run.call_args[0][0] == ['/custom/path/mmcli', '-m', '3']

@@ -40,7 +40,7 @@ def test_outbound_str_representation(db):
         state=OutboundSms.State.CREATED,
     )
     s = str(row)
-    assert '4412345678910' in s
+    assert '351913000387' in s
 
 
 def test_sms_destination_validator_accepts_international_numbers():

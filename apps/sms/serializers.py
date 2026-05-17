@@ -58,7 +58,10 @@ class OutboundSmsCreateSerializer(serializers.Serializer):
     )
     text = serializers.CharField(
         required=True,
-        max_length=1600,
         trim_whitespace=False,
         validators=[MinLengthValidator(1)],
+        help_text=(
+            'Full SMS payload (UTF-8). Length is constrained by modem/network encoding, '
+            'not by this gateway.'
+        ),
     )

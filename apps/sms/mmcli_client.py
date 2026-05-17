@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 import logging
 import os
 import re
@@ -189,31 +190,67 @@ class MMCLIClient:
         return sorted(set(_SMS_PATH_RE.findall(haystack)))
 
     def show_sms(self, sms_path: str) -> dict[str, str]:
-        for flag in ("--output-keyvalue", "--output-json"):
-            argv = [self.mmcli_path, "-s", sms_path, flag]
-            cp = self._run(argv)
-            if cp.returncode != 0:
-                raise MmcliError(
-                    f"Failed to inspect SMS ({flag})",
-                    stdout=cp.stdout or "",
-                    stderr=cp.stderr or "",
-                    exit_code=cp.returncode,
-                )
-            if flag.endswith("json"):
-                try:
-                    return _normalize_mmcli_json(cp.stdout or "")
-                except (json.JSONDecodeError, ValueError):
-                    continue
-            data = _parse_keyvalue(cp.stdout or "")
-            if data:
-                return data
-        cp = self._run([self.mmcli_path, "-s", sms_path])
-        self._ensure_ok(cp, "mmcli -s show")
-        return _parse_keyvalue(cp.stdout or "")
+        """Fetch SMS details from mmcli.
+
+        ModemManager exposes overlapping data via ``--output-keyvalue`` and
+        ``--output-json``. Keyvalue alone can omit ``sms.content.text`` while
+        metadata is present — we merge both snapshots and prefer the longest
+        non-empty string per field so concatenated/long bodies are not dropped.
+        """
+        cp_kv = self._run([self.mmcli_path, "-s", sms_path, "--output-keyvalue"])
+        if cp_kv.returncode != 0:
+            raise MmcliError(
+                'Failed to inspect SMS (--output-keyvalue)',
+                stdout=cp_kv.stdout or '',
+                stderr=cp_kv.stderr or '',
+                exit_code=cp_kv.returncode,
+            )
+        kv_data = _parse_keyvalue(cp_kv.stdout or '')
+
+        js_data: dict[str, str] = {}
+        cp_js = self._run([self.mmcli_path, "-s", sms_path, '--output-json'])
+        if cp_js.returncode == 0 and (cp_js.stdout or '').strip():
+            try:
+                js_data = _normalize_mmcli_json(cp_js.stdout or '')
+            except (json.JSONDecodeError, ValueError):
+                js_data = {}
+        merged_main = _merge_mmcli_sources(kv_data, js_data)
+        if merged_main:
+            return merged_main
+
+        cp_plain = self._run([self.mmcli_path, '-s', sms_path])
+        self._ensure_ok(cp_plain, 'mmcli -s show')
+        fallback = _parse_keyvalue(cp_plain.stdout or '')
+        merged_fb = _merge_mmcli_sources(kv_data, js_data, fallback)
+        return merged_fb
 
 
 def _normalize_key(raw: str) -> str:
     return "".join(ch for ch in str(raw).lower() if ch.isalnum())
+
+
+def _is_blank_mmcli_value(val: str) -> bool:
+    s = (val or '').strip()
+    return not s or s == '--'
+
+
+def _merge_mmcli_sources(*parts: dict[str, str]) -> dict[str, str]:
+    """Combine dicts produced from mmcli snapshots; longest non-blank wins per key."""
+    merged: dict[str, str] = {}
+    keys: set[str] = set()
+    for p in parts:
+        keys |= set(p)
+    for k in keys:
+        best = ''
+        for p in parts:
+            v = (p.get(k) or '').strip()
+            if _is_blank_mmcli_value(v):
+                continue
+            if not best or len(v) > len(best):
+                best = v
+        if best:
+            merged[k] = best
+    return merged
 
 
 def _parse_keyvalue(text: str) -> dict[str, str]:
@@ -230,12 +267,31 @@ def _parse_keyvalue(text: str) -> dict[str, str]:
     return out
 
 
+def _flatten_dict(nested: dict[str, Any], parent_key: str = '', sep: str = '.') -> dict[str, Any]:
+    """Recursively flatten nested dicts.
+
+    ``mmcli --output-json`` returns nested objects like
+    ``{"sms": {"content": {"text": "...", "number": "..."}}}``; we need flat
+    keys ``sms.content.text`` so ``_normalize_key`` produces ``smscontenttext``
+    like the keyvalue output path.
+    """
+    items: list[tuple[str, Any]] = []
+    for k, v in nested.items():
+        new_key = f'{parent_key}{sep}{k}' if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
 def _normalize_mmcli_json(raw: str) -> dict[str, str]:
     blob = json.loads(raw)
     if not isinstance(blob, dict):
         return {}
+    flattened = _flatten_dict(blob)
     normalized: dict[str, str] = {}
-    for key, val in blob.items():
+    for key, val in flattened.items():
         nk = _normalize_key(key)
         if not nk:
             continue
@@ -249,40 +305,56 @@ def _normalize_mmcli_json(raw: str) -> dict[str, str]:
 
 
 def extract_from_number(details: dict[str, str]) -> str:
-    for nk in ("number", "sender", "smssrc", "smsnumber", "mobilenumber"):
+    # --output-keyvalue: sms.content.number → smscontentnumber
+    # --output-json: varies; also try bare "number", "sender"
+    for nk in ("smscontentnumber", "number", "sender", "smssrc", "smsnumber", "mobilenumber"):
         v = details.get(nk)
-        if v:
+        if v and v.strip() not in ("--", ""):
             return v.strip()
     return ""
 
 
 def extract_text(details: dict[str, str]) -> str:
-    for nk in ("text", "smstext"):
+    # sms.content.text → smscontenttext; variants from JSON / ModemManager dumps
+    for nk in (
+        'smscontenttext',
+        'text',
+        'smstext',
+        'smscontent',
+        'smsmessage',
+        'message',
+        'body',
+        'content',
+        'smsbody',
+    ):
         v = details.get(nk)
-        if v:
+        if v and v.strip() not in ('--', ''):
             return v.strip()
-    return ""
+    return ''
 
 
 def extract_state(details: dict[str, str]) -> str:
-    for nk in ("state", "smsstate"):
+    # --output-keyvalue: sms.properties.state → smspropertiesstate
+    for nk in ("smspropertiesstate", "state", "smsstate"):
         v = details.get(nk)
-        if v:
+        if v and v.strip() not in ("--", ""):
             return v.strip()
     return ""
 
 
 def extract_smsc(details: dict[str, str]) -> str:
-    for nk in ("smsc", "smsservicecenter", "servicecenter"):
+    # --output-keyvalue: sms.properties.smsc → smspropertiessmsc
+    for nk in ("smspropertiessmsc", "smsc", "smsservicecenter", "servicecenter"):
         v = details.get(nk)
-        if v:
+        if v and v.strip() not in ("--", ""):
             return v.strip()
     return ""
 
 
 def extract_timestamp(details: dict[str, str]) -> str:
-    for nk in ("timestamp", "datetime", "stamp", "date"):
+    # --output-keyvalue: sms.properties.timestamp → smspropertiestimestamp
+    for nk in ("smspropertiestimestamp", "timestamp", "datetime", "stamp", "date"):
         v = details.get(nk)
-        if v:
+        if v and v.strip() not in ("--", ""):
             return v.strip()
     return ""

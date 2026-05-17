@@ -23,15 +23,30 @@ pip install -r requirements.txt
 
 ### Tests & coverage
 
+Run tests:
 ```bash
 python -m pytest
+```
+
+Run tests with coverage report:
+```bash
+# Using pytest-cov (recommended)
+python -m pytest --cov=apps --cov=config --cov-report=term --cov-report=html
+
+# Or using coverage directly
 coverage run -m pytest
-coverage report
+coverage report --include='apps/*,config/*'
+coverage html --include='apps/*,config/*'
+
+# Or use the convenience script
+./scripts/run_coverage.sh
 ```
 
 Older `manage.py test` no longer discovers any tests (`apps/sms/tests.py` was removed after the pytest migration). Use **pytest-django**, configured in **`pyproject.toml`**.
 
 **`pyproject.toml`** holds pytest/pytest-django settings. Coverage thresholds remain in **[`.coveragerc`](.coveragerc)** (`fail_under = 80`).
+
+The HTML coverage report is generated at `htmlcov/index.html` and can be viewed in a browser.
 
 ### API authentication
 
