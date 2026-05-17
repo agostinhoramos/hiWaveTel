@@ -16,6 +16,7 @@ python manage.py runserver
 
 Environment:
 
+- Inventário canónico de variáveis (Django, SMS/MQTT, `docker/entrypoint.sh`): copie **[`.env.example`](.env.example)** para **`.env`** na raiz; o Compose usa [`env_file: ../.env`](docker/docker-compose.yml). O mesmo modelo está em [`docker/.env.example`](docker/.env.example) para navegação na pasta `docker/`.
 - `DJANGO_SETTINGS_MODULE` defaults to **`config.settings`** (loads `development` or `production` from `DJANGO_ENV`).
 - Compose defaults to **`DJANGO_ENV=development`** with a dev-only `SECRET_KEY` fallback.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import random
 import threading
 import time
@@ -49,13 +50,61 @@ def _looks_sqlite_concurrency_error(exc: BaseException) -> bool:
     return 'locked' in lowered or 'busy' in lowered
 
 
+# ModemManager sometimes signals Messaging.Added before multipart text is readable via mmcli;
+# retries give the assembled body time to appear. Prefer explicit MM states when possible,
+# plus a hint-based path when SMS metadata exists but texto is empty (multipart assembly gap).
+_RETRY_MMCLI_SHOW_WHILE_STATES = frozenset({'receiving', 'unknown'})
+
+
+def _should_retry_empty_mmcli_snapshot(raw: dict[str, str], state_norm: str) -> bool:
+    """True when texto may still populate after subsequent mmcli snapshots."""
+    if state_norm in _RETRY_MMCLI_SHOW_WHILE_STATES:
+        return True
+    if state_norm != '':
+        return False
+    # State unset/omitted briefly; multipart often exposes number/timestamp antes do texto completo.
+    return bool(extract_from_number(raw).strip() or extract_timestamp(raw).strip())
+
+
 def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | None = None) -> InboundSms:
     mm = client or MMCLIClient()
+
+    empty_retries_raw = os.environ.get('MMCLI_EMPTY_TEXT_RETRIES', '5').strip()
+    empty_backoff_raw = os.environ.get('MMCLI_EMPTY_TEXT_BACKOFF_SEC', '1.5').strip()
     try:
-        raw = mm.show_sms(mm_path)
-    except MmcliError as exc:
-        _LOGGER.warning('mmcli show failed for %s: %s', mm_path, exc)
-        raw = {}
+        max_snapshot_tries = max(1, int(empty_retries_raw) if empty_retries_raw else 5)
+    except ValueError:
+        max_snapshot_tries = 5
+    try:
+        empty_backoff = float(empty_backoff_raw) if empty_backoff_raw else 1.5
+    except ValueError:
+        empty_backoff = 1.5
+    if empty_backoff <= 0:
+        empty_backoff = 1.5
+
+    raw: dict[str, str] = {}
+    for snap_attempt in range(max_snapshot_tries):
+        try:
+            raw = mm.show_sms(mm_path)
+        except MmcliError as exc:
+            _LOGGER.warning('mmcli show failed for %s: %s', mm_path, exc)
+            raw = {}
+        body = (extract_text(raw) or '').strip()
+        mm_state_norm = extract_state(raw).strip().lower()
+        if body:
+            break
+        keep_trying_because_state = _should_retry_empty_mmcli_snapshot(raw, mm_state_norm)
+        if not keep_trying_because_state or snap_attempt >= max_snapshot_tries - 1:
+            break
+        _LOGGER.info(
+            'Inbound SMS snapshot empty texto (multipart/race?): mm_path=%s state=%s attempt=%s/%s; retry in %.2fs',
+            mm_path,
+            mm_state_norm or '(unset)',
+            snap_attempt + 1,
+            max_snapshot_tries,
+            empty_backoff,
+        )
+        time.sleep(empty_backoff)
 
     defaults = {
         'modem_index': modem_index,

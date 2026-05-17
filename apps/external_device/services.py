@@ -355,11 +355,12 @@ def sync_inbox_from_modem_store(device: ExternalDevice) -> None:
     inbound_rows = qs.order_by('-created_at')[:500]
     created_count = 0
     existing_count = 0
-    
+    patched_count = 0
+
     for inbound in inbound_rows:
         # Include device.pk in message_id to support multiple devices (message_id is unique=True)
         message_id = f'mmcli_{inbound.pk}_dev_{device.pk}'
-        _, created = InboxMessage.objects.get_or_create(
+        inbox_msg, created = InboxMessage.objects.get_or_create(
             message_id=message_id,
             defaults={
                 'device': device,
@@ -374,6 +375,16 @@ def sync_inbox_from_modem_store(device: ExternalDevice) -> None:
             created_count += 1
         else:
             existing_count += 1
+            patched: dict[str, str] = {}
+            if not inbox_msg.sender and inbound.from_number:
+                patched['sender'] = inbound.from_number
+            if not inbox_msg.body and inbound.text:
+                patched['body'] = inbound.text
+            if patched:
+                for key, val in patched.items():
+                    setattr(inbox_msg, key, val)
+                inbox_msg.save(update_fields=list(patched.keys()))
+                patched_count += 1
 
     if total_inbound == 0:
         available_modem_indexes = sorted(
@@ -388,13 +399,14 @@ def sync_inbox_from_modem_store(device: ExternalDevice) -> None:
         )
     else:
         _LOGGER.info(
-            'Inbox sync device=%s filter=%s inbound_total=%s scanned=%s mirrored_created=%s mirrored_existing=%s',
+            'Inbox sync device=%s filter=%s inbound_total=%s scanned=%s mirrored_created=%s mirrored_existing=%s patched_body=%s',
             device.device_id,
             filter_description,
             total_inbound,
             len(inbound_rows),
             created_count,
             existing_count,
+            patched_count,
         )
 
 
