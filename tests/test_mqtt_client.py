@@ -67,6 +67,7 @@ class TestGatewayMqttClientInit:
         MQTT_QOS=1,
         MQTT_CLEAN_SESSION=True,
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
     )
     def test_init_with_credentials(self, mock_mqtt_client_class):
         """Should initialize client with credentials."""
@@ -180,6 +181,7 @@ class TestGatewayMqttClientPublish:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -207,6 +209,7 @@ class TestGatewayMqttClientPublish:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -238,6 +241,7 @@ class TestGatewayMqttClientCallbacks:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -270,6 +274,7 @@ class TestGatewayMqttClientCallbacks:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -295,6 +300,7 @@ class TestGatewayMqttClientCallbacks:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -320,6 +326,7 @@ class TestGatewayMqttClientCallbacks:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=1,
         MQTT_BROKER_URL='test-broker.local',
         MQTT_PORT=1883,
@@ -328,7 +335,7 @@ class TestGatewayMqttClientCallbacks:
         MQTT_CLIENT_ID='test-gateway',
         MQTT_KEEPALIVE=60,
         MQTT_CLEAN_SESSION=True,
-        MQTT_HEALTH_AUTO_PONG=False,
+        MQTT_HEALTH_PING_SUBSCRIBE=False,
     )
     def test_on_connect_health_ping_subscription_disabled(self, mock_mqtt_client_class):
         mock_client_instance = MagicMock()
@@ -484,7 +491,7 @@ class TestGatewayMqttClientOnMessage:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
-        MQTT_HEALTH_AUTO_PONG=False,
+        MQTT_HEALTH_PING_SUBSCRIBE=False,
     )
     def test_on_message_health_ping_skipped_when_disabled(self, mock_mqtt_client_class):
         mock_client_instance = MagicMock()
@@ -524,9 +531,18 @@ class TestGatewayMqttClientOnMessage:
         mock_client_instance.publish.assert_called_once()
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
-    @override_settings(MQTT_EXTERNAL_TOPIC_PREFIX='pfx')
-    def test_on_message_health_ping_django_skips_pong_by_default(self, mock_mqtt_client_class):
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+    )
+    def test_on_message_health_ping_django_publishes_pong_when_mqtt_auto_pong_default(
+        self,
+        mock_mqtt_client_class,
+    ):
+        """MQTT_HEALTH_AUTO_PONG=true echoes ping_id to pong for tipo B servidor (source=django)."""
         mock_client_instance = MagicMock()
+        mock_pub_info = MagicMock()
+        mock_client_instance.publish.return_value = mock_pub_info
         mock_mqtt_client_class.return_value = mock_client_instance
 
         client = GatewayMqttClient()
@@ -538,6 +554,47 @@ class TestGatewayMqttClientOnMessage:
             }).encode('utf-8'),
         )
         client._on_message(mock_client_instance, None, msg)
+        mock_client_instance.publish.assert_called_once()
+        pub_topic, pub_body = mock_client_instance.publish.call_args[0][:2]
+        assert pub_topic == 'pfx/devices/351912329317/health/pong'
+        body = json.loads(pub_body)
+        assert body['ping_id'] == 'ping_x'
+        assert body['source'] == 'hiwavetel_gateway'
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+        MQTT_HEALTH_AUTO_PONG=False,
+        MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO=True,
+    )
+    def test_handle_health_ping_django_publishes_pong_when_only_lab_flag(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_pub_info = MagicMock()
+        mock_client_instance.publish.return_value = mock_pub_info
+        mock_mqtt_client_class.return_value = mock_client_instance
+        client = GatewayMqttClient()
+        client._handle_health_ping(
+            'pfx/devices/351912329317/health/ping',
+            {'ping_id': 'ping_x', 'source': 'django'},
+        )
+        mock_client_instance.publish.assert_called_once()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+        MQTT_HEALTH_AUTO_PONG=False,
+        MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO=False,
+    )
+    def test_handle_health_ping_django_skips_gateway_pong_when_both_disabled(self, mock_mqtt_client_class):
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+        client = GatewayMqttClient()
+        client._handle_health_ping(
+            'pfx/devices/351912329317/health/ping',
+            {'ping_id': 'ping_x', 'source': 'django', 'timestamp': '2026-01-01T00:00:00Z'},
+        )
         mock_client_instance.publish.assert_not_called()
 
     @patch('apps.external_device.mqtt_client.mqtt.Client')
@@ -712,7 +769,7 @@ class TestGatewayMqttClientOnMessage:
             client._on_message(mock_client_instance, None, msg)
             mock_sched.assert_not_called()
 
-    @override_settings(MQTT_EXTERNAL_TOPIC_PREFIX='pfx')
+    @override_settings(MQTT_EXTERNAL_TOPIC_PREFIX='pfx', MQTT_BASE_TOPIC_PREFIX='pfx')
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @patch('apps.external_device.mqtt_client._publish_json_ephemeral')
     @patch('apps.external_device.mqtt_client.build_modem_status_mqtt_payload')
@@ -746,6 +803,75 @@ class TestGatewayMqttClientOnMessage:
 
         # Should not raise exception
         client._on_message(mock_client_instance, None, msg)
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+        MQTT_HEALTH_PING_SUBSCRIBE=True,
+        MQTT_HEALTH_AUTO_PONG=False,
+    )
+    def test_subscribe_health_ping_when_auto_pong_disabled(self, mock_mqtt_client_class):
+        """With MQTT_HEALTH_AUTO_PONG=False but MQTT_HEALTH_PING_SUBSCRIBE=True the gateway
+        must still subscribe to health/ping (so telemetry arrives) but must not publish a pong
+        when it receives a source=django ping without ping_id-triggering conditions."""
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        client._on_connect(mock_client_instance, None, {}, 0)
+
+        topics = {c[0][0] for c in mock_client_instance.subscribe.call_args_list}
+        assert 'pfx/devices/+/health/ping' in topics
+
+        # receiving a source=django ping must NOT publish pong when auto-pong is disabled
+        msg = SimpleNamespace(
+            topic='pfx/devices/351912329317/health/ping',
+            payload=json.dumps({'ping_id': 'ping_nopong', 'source': 'django'}).encode('utf-8'),
+        )
+        mock_client_instance.reset_mock()
+        client._on_message(mock_client_instance, None, msg)
+        mock_client_instance.publish.assert_not_called()
+
+    @patch('apps.external_device.mqtt_client.mqtt.Client')
+    @override_settings(
+        MQTT_EXTERNAL_TOPIC_PREFIX='pfx',
+        MQTT_BASE_TOPIC_PREFIX='pfx',
+    )
+    def test_handle_health_ping_telemetry_without_django_source(self, mock_mqtt_client_class):
+        """Type-A telemetry ping (battery_level/network_type, no source=django) must
+        persist DeviceHealthTelemetry and mark the device seen."""
+        from apps.external_device.models import DeviceHealthTelemetry, ExternalDevice
+
+        device = ExternalDevice.objects.create(
+            device_id='+351912329317',
+            name='Telemetry Device',
+            api_key_hash='y',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        mock_client_instance = MagicMock()
+        mock_mqtt_client_class.return_value = mock_client_instance
+
+        client = GatewayMqttClient()
+        client._handle_health_ping(
+            'pfx/devices/351912329317/health/ping',
+            {
+                'timestamp': '2026-05-18T10:00:00Z',
+                'app_version': '1.2.0',
+                'battery_level': 72,
+                'network_type': 'Cellular',
+            },
+        )
+
+        rows = DeviceHealthTelemetry.objects.filter(device=device)
+        assert rows.count() == 1
+        row = rows.first()
+        assert row.battery_level == 72
+        assert row.network_type == 'Cellular'
+        assert row.app_version == '1.2.0'
+        device.refresh_from_db()
+        assert device.is_available is True
+        assert device.last_seen is not None
 
 
 @pytest.mark.django_db
@@ -989,6 +1115,7 @@ class TestEphemeralMqttPublish:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='hiwavetel',
+        MQTT_BASE_TOPIC_PREFIX='hiwavetel',
         MQTT_QOS=2,
         MQTT_BROKER_URL='brk.example',
         MQTT_PORT=11883,
@@ -1044,6 +1171,7 @@ class TestEphemeralMqttPublish:
     @patch('apps.external_device.mqtt_client.mqtt.Client')
     @override_settings(
         MQTT_EXTERNAL_TOPIC_PREFIX='p2',
+        MQTT_BASE_TOPIC_PREFIX='p2',
         MQTT_QOS=2,
         MQTT_BROKER_URL='x',
         MQTT_PORT=1883,

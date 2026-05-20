@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import uuid
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import paho.mqtt.client as mqtt
@@ -19,6 +20,10 @@ if TYPE_CHECKING:
     from paho.mqtt.client import MQTTMessage
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Global remote client instance (set by run_mqtt_gateway command)
+_global_remote_client = None
 
 
 def _paho_client_connected(client: mqtt.Client) -> bool:
@@ -137,7 +142,16 @@ def device_topic_from_flat_config(
 
 
 def build_django_health_ping_payload() -> dict[str, Any]:
-    """Active server ping body for gateways/apps subscribed on ``TOPIC_HEALTH_PING`` (hiDisheLink)."""
+    """Body for server-originated ``health/ping`` (``source`` is ``django``).
+
+    When ``MQTT_HEALTH_AUTO_PONG`` is true, this gateway echoes each received ``ping_id`` to
+    ``health/pong`` on the MQTT loop—including when the broker delivers that same ping back onto
+    the wildcard subscription—or the mobile / external MQTT integration may pong instead.
+
+    Responses that update ``ExternalDevice`` presence ultimately come via ``health/pong`` /
+    telemetry (see docs/comunicacao.md §5.6)—not by treating server-origin ``django`` ping receipt
+    alone as device telemetry.
+    """
     from django.utils import timezone
 
     return {
@@ -178,15 +192,15 @@ class GatewayMqttClient:
     Subscribes to:
     - ``{device_topic_prefix}/+/sms/status`` — external devices publish SMS job status
     - ``{device_topic_prefix}/+/sms/inbox`` — external devices publish inbound SMS
-    - ``{device_topic_prefix}/+/health/ping`` — hiDisheLink health ping (optional); gateway replies on ``…/health/pong``
-    - ``{device_topic_prefix}/+/health/pong`` — gateway logs device online when apps reply to Django pings (optional)
+    - ``{device_topic_prefix}/+/health/ping`` — device-side traffic; gateway may also see broker echo of its tipo B pings; with ``MQTT_HEALTH_AUTO_PONG``, replies on ``…/health/pong``
+    - ``{device_topic_prefix}/+/health/pong`` — updates ``ExternalDevice`` when received (app or gateway pong)
     - ``{prefix}/modems/snapshot`` and ``{prefix}/modems/contacts`` — gateway catalog (optional)
     - ``{prefix}/modems/+/status/request`` — request full modem snapshot (mmcli), optional
 
     Publishes:
     - ``{device_topic_prefix}/…/sms/send`` and ``…/inbox/ack``
-    - ``{device_topic_prefix}/…/health/ping`` — periodic Django tipo B pings when ``MQTT_HEALTH_SERVER_PING_INTERVAL_SEC`` > 0
-    - ``{device_topic_prefix}/…/health/pong`` — automatic reply to ``health/ping`` when enabled
+    - ``{device_topic_prefix}/…/health/ping`` — periodic Django tipo B pings when ``MQTT_HEALTH_SERVER_PING_INTERVAL_SEC`` > 0 (**consumer**: hiDisheLink app or MQTT client from mqtt-config ``TOPIC_HEALTH_PING``, not REST-only)
+    - ``{device_topic_prefix}/…/health/pong`` — automatic ``ping_id`` reply to ``health/ping`` when ``MQTT_HEALTH_AUTO_PONG`` / lab django flag (see ``_handle_health_ping``)
     - ``{prefix}/modems/N/status/telemetry`` — unsolicited modem snapshots (bootstrap / ``state_change``)
     - ``{prefix}/modems/N/status/response`` — modem snapshot (MQTT request reply over ephemeral publisher)
     """
@@ -249,7 +263,7 @@ class GatewayMqttClient:
 
         self.subscribe_modem_status = getattr(settings, 'MQTT_MODEM_STATUS_SUBSCRIBE', True)
         self.subscribe_modem_catalog = getattr(settings, 'MQTT_SUBSCRIBE_MODEM_CATALOG', True)
-        self.subscribe_health_ping = getattr(settings, 'MQTT_HEALTH_AUTO_PONG', True)
+        self.subscribe_health_ping = getattr(settings, 'MQTT_HEALTH_PING_SUBSCRIBE', True)
         self.subscribe_health_pong = getattr(settings, 'MQTT_HEALTH_SUBSCRIBE_PONG', True)
         self.gateway_auto_pong_django = getattr(settings, 'MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO', False)
         hp_qos = int(getattr(settings, 'MQTT_HEALTH_PING_SUBSCRIBE_QOS', 0))
@@ -468,7 +482,14 @@ class GatewayMqttClient:
         device.mark_seen()
 
     def _handle_health_ping(self, topic: str, payload: dict[str, Any]) -> None:
-        """Handle ``health/ping``: Android telemetry (tipo A), Django latency ping (tipo B), or legacy echo."""
+        """Handle ``health/ping``: Android telemetry (tipo A), servidor tipo B (`source`=django), or legacy echo.
+
+        Pings ``source=django`` do not imply device presence until ``health/pong`` is processed or telemetry
+        is stored. Por defeito (**``MQTT_HEALTH_AUTO_PONG``**), este gateway volta a publicar ``health/pong``
+        com o mesmo ``ping_id`` para todos os pings com ``ping_id`` (incl. tipo B servidor). Opcionalmente
+        **``MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO``** actua em conjunto (ver código). Resposta efectiva também
+        pode vir da app hiDisheLink ou cliente MQTT externos (docs/comunicacao.md §5.6).
+        """
         src = str(payload.get('source') or '').strip().lower()
         if src == 'hiwavetel_gateway':
             return
@@ -491,12 +512,25 @@ class GatewayMqttClient:
             return
 
         if src_django_exact:
-            if self.gateway_auto_pong_django:
+            # Same rule as legacy pings below: MQTT_HEALTH_AUTO_PONG (default true in settings)
+            # echoes ping_id to health/pong — including tipo B servidor (source=django). Optional
+            # MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO retains meaning when callers disable the global flag
+            # but keep this lab toggle true (paired use is rare).
+            mqtt_auto_pong = getattr(settings, 'MQTT_HEALTH_AUTO_PONG', True)
+            if payload.get('ping_id') and (mqtt_auto_pong or self.gateway_auto_pong_django):
                 self._publish_gateway_health_pong(sanitized, payload)
             else:
+                ping_short = str(payload.get('ping_id') or '')[:48]
                 _LOGGER.debug(
-                    'health/ping django ping_id=%s (gateway auto-pong disabled; Android responds)',
-                    str(payload.get('ping_id') or '')[:48],
+                    'health/ping django ping_id=%s (no gateway pong: need ping_id and '
+                    'MQTT_HEALTH_AUTO_PONG or MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO)',
+                    ping_short,
+                )
+                _LOGGER.debug(
+                    'source=django ping does not touch ExternalDevice presence from ping alone '
+                    '(see docs/comunicacao.md §5.6): app/gateway MQTT may still pong with '
+                    'same ping_id and/or telemetry on health/ping. ping_id=%s',
+                    ping_short,
                 )
             return
 
@@ -743,7 +777,11 @@ class GatewayMqttClient:
                 self._modem_status_publish_telemetry(idx, telemetry)
 
     def _mqtt_publish_scheduled_health_pings(self) -> None:
-        """Publish tipo B ``health/ping`` for each active external device (connected client)."""
+        """Publish tipo B ``health/ping`` for each active ExternalDevice.
+
+        Pong / telemetry replies must come from the device's MQTT client (hiDisheLink or
+        mqtt-config ``TOPIC_*``), not from Django HTTP acting as the pong consumer alone.
+        """
         for device_id in ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE).values_list(
             'device_id', flat=True
         ):
@@ -765,7 +803,11 @@ class GatewayMqttClient:
         _LOGGER.debug('MQTT server health ping runner stopped')
 
     def _publish_server_health_ping_connected(self, device_id: str) -> None:
-        """Publish Django-originated health ping using the persistent gateway MQTT session."""
+        """Publish Django ``health/ping`` on the persistent gateway MQTT session.
+
+        Consumer side is the hiDisheLink app or MQTT client using ``TOPIC_HEALTH_PING`` from
+        that device's ``mqtt-config``.
+        """
         cfg: dict[str, Any] = mqtt_flat_cfg_for_device_id(device_id)
         topic = device_topic_from_flat_config(
             cfg,
@@ -1033,3 +1075,520 @@ def publish_health_ping_ephemeral(
     conn = ephemeral_connection_from_flat(cfg)
     ok = _publish_json_ephemeral(topic, body, conn or None)
     return body, ok, topic
+
+
+# Alias for backward compatibility (will be refactored to LocalGatewayClient)
+LocalGatewayClient = GatewayMqttClient
+
+
+class RemoteHiDishelinkClient:
+    """MQTT client for hiWaveTel acting as Device/Gateway Client in hiDisheLink architecture.
+    
+    This client connects to the **remote hiDisheLink broker** and implements the contract from
+    section 10 of the hiDisheLink MQTT architecture document:
+    
+    Subscribes to:
+    - TOPIC_SMS_SEND - receive SMS send requests from hiDisheLink server
+    - TOPIC_HEALTH_PING - receive health probes from hiDisheLink server
+    - TOPIC_SMS_INBOX_ACK - receive ACKs for inbox messages
+    
+    Publishes to:
+    - TOPIC_SMS_STATUS - report SMS send status (received ACK + final status)
+    - TOPIC_SMS_INBOX - report inbound SMS from local modem
+    - TOPIC_HEALTH_PONG - respond to health probes
+    - TOPIC_HEALTH_PING - heartbeat telemetry (without source:django)
+    
+    All SMS and health messages use QoS 1 per hiDisheLink spec.
+    """
+    
+    def __init__(self, mqtt_config: dict[str, Any], device_id: str):
+        """Initialize remote hiDisheLink MQTT client.
+        
+        Args:
+            mqtt_config: Full mqtt-config response from hiDisheLink API
+            device_id: Device ID for this gateway (E.164 format, e.g. +351912329317)
+        """
+        self._mqtt_cfg = dict(mqtt_config)
+        self.device_id = device_id
+        self.sanitized_device_id = sanitize_device_id(device_id)
+        
+        # Extract connection params from mqtt-config
+        def pick_str(key: str, fallback: str) -> str:
+            v = self._mqtt_cfg.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+            return fallback
+        
+        def pick_int(key: str, fallback: int) -> int:
+            v = self._mqtt_cfg.get(key)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                return fallback
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return fallback
+        
+        def pick_bool(key: str, fallback: bool) -> bool:
+            if key not in self._mqtt_cfg:
+                return fallback
+            raw = str(self._mqtt_cfg[key]).strip().lower()
+            if raw in ('true', '1', 'yes', 'on'):
+                return True
+            if raw in ('false', '0', 'no', 'off'):
+                return False
+            return fallback
+        
+        self.broker_url = pick_str('MQTT_BROKER_URL', settings.MQTT_BROKER_URL)
+        self.port = pick_int('MQTT_PORT', settings.MQTT_PORT)
+        self.username = pick_str('MQTT_USERNAME', '') or pick_str('MQTT_USER', '') or settings.MQTT_USER
+        self.password = pick_str('MQTT_PASSWORD', '') or pick_str('MQTT_PASS', '') or settings.MQTT_PASS
+        self.keepalive = pick_int('MQTT_KEEPALIVE', settings.MQTT_KEEPALIVE)
+        self.qos = pick_int('MQTT_QOS', 1)  # Default QoS 1 for hiDisheLink
+        self.clean_session = pick_bool('MQTT_CLEAN_SESSION', False)  # Persistent session for reliability
+        
+        # Client ID: hiwavetel_remote_{sanitized}_{timestamp}
+        import time
+        self.client_id = f'hiwavetel_remote_{self.sanitized_device_id}_{int(time.time())}'[:23]
+        
+        # Resolve topics from templates
+        self.topic_sms_send = self._resolve_topic('TOPIC_SMS_SEND', '{prefix}/{sanitized}/sms/send')
+        self.topic_sms_status = self._resolve_topic('TOPIC_SMS_STATUS', '{prefix}/{sanitized}/sms/status')
+        self.topic_sms_inbox = self._resolve_topic('TOPIC_SMS_INBOX', '{prefix}/{sanitized}/sms/inbox')
+        self.topic_sms_inbox_ack = self._resolve_topic('TOPIC_SMS_INBOX_ACK', '{prefix}/{sanitized}/sms/inbox/ack')
+        self.topic_health_ping = self._resolve_topic('TOPIC_HEALTH_PING', '{prefix}/{sanitized}/health/ping')
+        self.topic_health_pong = self._resolve_topic('TOPIC_HEALTH_PONG', '{prefix}/{sanitized}/health/pong')
+        
+        # Health heartbeat settings
+        self.health_heartbeat_interval = float(
+            getattr(settings, 'MQTT_REMOTE_HEALTH_HEARTBEAT_SEC', 60.0)
+        )
+        self._heartbeat_stop = threading.Event()
+        
+        # Chunking buffer for SMS send requests
+        self._chunk_buffer: dict[str, dict[str, Any]] = {}
+        self._chunk_lock = threading.Lock()
+        self._chunk_ttl_sec = 300  # 5 minutes
+        
+        # Create Paho client
+        self.client = mqtt.Client(
+            client_id=self.client_id,
+            clean_session=self.clean_session,
+            protocol=mqtt.MQTTv311,
+        )
+        
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+        
+        if self.username and self.password:
+            self.client.username_pw_set(self.username, self.password)
+        
+        if self.port == 8883:
+            self.client.tls_set()
+        
+        _LOGGER.info(
+            'RemoteHiDishelinkClient initialized device=%s broker=%s:%d client_id=%s',
+            self.device_id,
+            self.broker_url,
+            self.port,
+            self.client_id,
+        )
+    
+    def _resolve_topic(self, template_key: str, legacy_fmt: str) -> str:
+        """Resolve MQTT topic from template or legacy format."""
+        return device_topic_from_flat_config(
+            self._mqtt_cfg,
+            template_key,
+            legacy_fmt,
+            self.device_id,
+        )
+    
+    def connect(self) -> None:
+        """Connect to remote hiDisheLink MQTT broker."""
+        _LOGGER.info(
+            'RemoteHiDishelinkClient connecting to %s:%d device=%s',
+            self.broker_url,
+            self.port,
+            self.device_id,
+        )
+        self.client.connect(self.broker_url, self.port, self.keepalive)
+    
+    def loop_forever(self) -> None:
+        """Start MQTT client loop (blocking)."""
+        _LOGGER.info('RemoteHiDishelinkClient starting loop device=%s', self.device_id)
+        self.client.loop_forever()
+    
+    def loop_start(self) -> None:
+        """Start MQTT client loop in background thread."""
+        _LOGGER.info('RemoteHiDishelinkClient starting background loop device=%s', self.device_id)
+        self.client.loop_start()
+    
+    def loop_stop(self) -> None:
+        """Stop MQTT client background loop."""
+        _LOGGER.info('RemoteHiDishelinkClient stopping loop device=%s', self.device_id)
+        self.client.loop_stop()
+    
+    def disconnect(self) -> None:
+        """Disconnect from remote broker."""
+        self._heartbeat_stop.set()
+        _LOGGER.info('RemoteHiDishelinkClient disconnecting device=%s', self.device_id)
+        self.client.disconnect()
+    
+    def _on_connect(self, client: mqtt.Client, userdata: Any, flags: dict, rc: int) -> None:
+        """Callback when connected to remote broker."""
+        if rc == 0:
+            _LOGGER.info('RemoteHiDishelinkClient connected successfully device=%s', self.device_id)
+            self._subscribe_to_topics()
+            self._heartbeat_stop.clear()
+            
+            # Start health heartbeat thread
+            if self.health_heartbeat_interval > 0:
+                threading.Thread(
+                    target=self._health_heartbeat_runner,
+                    daemon=True,
+                    name=f'mqtt-remote-heartbeat-{self.sanitized_device_id}',
+                ).start()
+            
+            # Start chunk cleanup thread
+            threading.Thread(
+                target=self._chunk_cleanup_runner,
+                daemon=True,
+                name=f'mqtt-remote-chunk-cleanup-{self.sanitized_device_id}',
+            ).start()
+        else:
+            _LOGGER.error('RemoteHiDishelinkClient connection failed rc=%d device=%s', rc, self.device_id)
+    
+    def _chunk_cleanup_runner(self) -> None:
+        """Periodic cleanup of expired chunk buffers."""
+        cleanup_interval = 60.0  # Check every minute
+        _LOGGER.debug('RemoteHiDishelinkClient chunk cleanup started device=%s', self.device_id)
+        
+        while not self._heartbeat_stop.wait(timeout=cleanup_interval):
+            try:
+                self._cleanup_expired_chunks()
+            except Exception:
+                _LOGGER.exception('RemoteHiDishelinkClient chunk cleanup failed')
+        
+        _LOGGER.debug('RemoteHiDishelinkClient chunk cleanup stopped device=%s', self.device_id)
+    
+    def _on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
+        """Callback when disconnected from remote broker."""
+        self._heartbeat_stop.set()
+        if rc == 0:
+            _LOGGER.info('RemoteHiDishelinkClient disconnected gracefully device=%s', self.device_id)
+        else:
+            _LOGGER.warning(
+                'RemoteHiDishelinkClient disconnected unexpectedly rc=%d device=%s',
+                rc,
+                self.device_id,
+            )
+    
+    def _subscribe_to_topics(self) -> None:
+        """Subscribe to remote hiDisheLink topics."""
+        subs = [
+            (self.topic_sms_send, 1),  # QoS 1 for SMS
+            (self.topic_health_ping, 1),  # QoS 1 for health
+            (self.topic_sms_inbox_ack, 1),  # QoS 1 for ACKs
+        ]
+        
+        for topic, qos in subs:
+            self.client.subscribe(topic, qos=qos)
+        
+        topics_str = ', '.join(t for t, _ in subs)
+        _LOGGER.info('RemoteHiDishelinkClient subscribed to: %s device=%s', topics_str, self.device_id)
+    
+    def _on_message(self, client: mqtt.Client, userdata: Any, msg: MQTTMessage) -> None:
+        """Callback when message received from remote broker."""
+        topic = msg.topic
+        payload_str = msg.payload.decode('utf-8')
+        
+        _LOGGER.debug('RemoteHiDishelinkClient received on %s: %s', topic, payload_str[:200])
+        
+        try:
+            payload = json.loads(payload_str) if payload_str.strip() else {}
+            if not isinstance(payload, dict):
+                payload = {}
+        except json.JSONDecodeError:
+            _LOGGER.warning('RemoteHiDishelinkClient invalid JSON on %s: %s', topic, payload_str[:100])
+            return
+        
+        # Route messages
+        if topic == self.topic_sms_send:
+            self._handle_sms_send(payload)
+        elif topic == self.topic_health_ping:
+            self._handle_health_ping(payload)
+        elif topic == self.topic_sms_inbox_ack:
+            self._handle_inbox_ack(payload)
+        else:
+            _LOGGER.warning('RemoteHiDishelinkClient unknown topic: %s', topic)
+    
+    def _handle_sms_send(self, payload: dict[str, Any]) -> None:
+        """Handle SMS send request from hiDisheLink server (section 4 of spec).
+        
+        Implements chunking aggregation per section 10.10 (checklist item 9):
+        - Buffer chunks with same request_id
+        - Wait for all chunks (chunk_index 0 to chunk_total-1)
+        - Process aggregated recipients as single job
+        """
+        request_id = payload.get('request_id', '').strip()
+        if not request_id:
+            _LOGGER.warning('RemoteHiDishelinkClient SMS send missing request_id')
+            return
+        
+        chunk_index = payload.get('chunk_index')
+        chunk_total = payload.get('chunk_total')
+        
+        # No chunking - process immediately
+        if chunk_index is None or chunk_total is None:
+            from .services import handle_remote_sms_send
+            threading.Thread(
+                target=handle_remote_sms_send,
+                args=(self, payload),
+                daemon=True,
+                name=f'remote-sms-{request_id[:16]}',
+            ).start()
+            return
+        
+        # Chunking - buffer and aggregate
+        with self._chunk_lock:
+            if request_id not in self._chunk_buffer:
+                self._chunk_buffer[request_id] = {
+                    'chunks': {},
+                    'chunk_total': chunk_total,
+                    'timestamp': timezone.now(),
+                    'message': payload.get('message'),
+                    'priority': payload.get('priority'),
+                }
+            
+            buffer_entry = self._chunk_buffer[request_id]
+            buffer_entry['chunks'][chunk_index] = payload.get('recipients', [])
+            
+            _LOGGER.info(
+                'RemoteHiDishelinkClient SMS chunk buffered request_id=%s chunk=%s/%s',
+                request_id,
+                chunk_index,
+                chunk_total,
+            )
+            
+            # Check if we have all chunks
+            if len(buffer_entry['chunks']) == chunk_total:
+                # Aggregate recipients from all chunks (sorted by chunk_index)
+                all_recipients = []
+                for idx in sorted(buffer_entry['chunks'].keys()):
+                    all_recipients.extend(buffer_entry['chunks'][idx])
+                
+                # Create aggregated payload
+                aggregated_payload = {
+                    'request_id': request_id,
+                    'recipients': all_recipients,
+                    'message': buffer_entry['message'],
+                    'priority': buffer_entry['priority'],
+                }
+                
+                # Remove from buffer
+                del self._chunk_buffer[request_id]
+                
+                _LOGGER.info(
+                    'RemoteHiDishelinkClient SMS chunks complete request_id=%s total_recipients=%s',
+                    request_id,
+                    len(all_recipients),
+                )
+                
+                # Process aggregated request
+                from .services import handle_remote_sms_send
+                threading.Thread(
+                    target=handle_remote_sms_send,
+                    args=(self, aggregated_payload),
+                    daemon=True,
+                    name=f'remote-sms-{request_id[:16]}',
+                ).start()
+            else:
+                _LOGGER.debug(
+                    'RemoteHiDishelinkClient SMS waiting for more chunks request_id=%s got=%s/%s',
+                    request_id,
+                    len(buffer_entry['chunks']),
+                    chunk_total,
+                )
+    
+    def _cleanup_expired_chunks(self) -> None:
+        """Remove expired chunk buffers (TTL cleanup)."""
+        from django.utils import timezone as tz
+        
+        with self._chunk_lock:
+            expired = []
+            cutoff = tz.now() - timedelta(seconds=self._chunk_ttl_sec)
+            
+            for request_id, buffer_entry in self._chunk_buffer.items():
+                if buffer_entry['timestamp'] < cutoff:
+                    expired.append(request_id)
+            
+            for request_id in expired:
+                buffer_entry = self._chunk_buffer.pop(request_id)
+                _LOGGER.warning(
+                    'RemoteHiDishelinkClient SMS chunk buffer expired request_id=%s got=%s/%s',
+                    request_id,
+                    len(buffer_entry['chunks']),
+                    buffer_entry['chunk_total'],
+                )
+    
+    def _handle_health_ping(self, payload: dict[str, Any]) -> None:
+        """Handle health ping from hiDisheLink server (section 7 of spec)."""
+        source = payload.get('source')
+        ping_id = payload.get('ping_id')
+        
+        # Respond to server probes (source=django with ping_id)
+        if source == 'django' and ping_id:
+            self.publish_health_pong(ping_id, payload.get('timestamp'))
+    
+    def _handle_inbox_ack(self, payload: dict[str, Any]) -> None:
+        """Handle inbox ACK from hiDisheLink server (section 6 of spec)."""
+        message_id = payload.get('message_id')
+        if message_id:
+            _LOGGER.info('RemoteHiDishelinkClient inbox ACK received message_id=%s', message_id)
+            # Can mark local message as ACKed if tracking is needed
+    
+    def publish_sms_status(self, request_id: str, status: str, payload: dict[str, Any]) -> bool:
+        """Publish SMS status to hiDisheLink server (section 5 of spec).
+        
+        Args:
+            request_id: Request ID from sms/send
+            status: 'received', 'success', 'partial', or 'error'
+            payload: Full status payload with sent/failed counts and details
+            
+        Returns:
+            True if publish succeeded
+        """
+        from django.utils import timezone
+        
+        msg = dict(payload)
+        msg['request_id'] = request_id
+        msg['status'] = status
+        msg['device_id'] = self.device_id
+        if 'timestamp' not in msg:
+            msg['timestamp'] = timezone.now().isoformat()
+        
+        try:
+            body = json.dumps(msg, ensure_ascii=False)
+            info = self.client.publish(self.topic_sms_status, body, qos=1)  # QoS 1
+            info.wait_for_publish(timeout=5.0)
+            _LOGGER.info(
+                'RemoteHiDishelinkClient published SMS status request_id=%s status=%s',
+                request_id,
+                status,
+            )
+            return True
+        except Exception:
+            _LOGGER.exception(
+                'RemoteHiDishelinkClient failed to publish SMS status request_id=%s',
+                request_id,
+            )
+            return False
+    
+    def publish_sms_inbox(self, message_id: str, sender: str, body_text: str, timestamp: str) -> bool:
+        """Publish inbound SMS to hiDisheLink server (section 6 of spec).
+        
+        Args:
+            message_id: Unique message ID
+            sender: Sender phone number
+            body_text: SMS content
+            timestamp: ISO 8601 timestamp
+            
+        Returns:
+            True if publish succeeded
+        """
+        payload = {
+            'message_id': message_id,
+            'sender': sender,
+            'body': body_text,
+            'timestamp': timestamp,
+        }
+        
+        try:
+            msg = json.dumps(payload, ensure_ascii=False)
+            info = self.client.publish(self.topic_sms_inbox, msg, qos=1)  # QoS 1
+            info.wait_for_publish(timeout=5.0)
+            _LOGGER.info(
+                'RemoteHiDishelinkClient published inbox message_id=%s sender=%s',
+                message_id,
+                sender,
+            )
+            return True
+        except Exception:
+            _LOGGER.exception(
+                'RemoteHiDishelinkClient failed to publish inbox message_id=%s',
+                message_id,
+            )
+            return False
+    
+    def publish_health_pong(self, ping_id: str, ping_timestamp: str | None = None) -> bool:
+        """Publish health pong to hiDisheLink server (section 7 of spec).
+        
+        Args:
+            ping_id: Ping ID from health/ping
+            ping_timestamp: Original timestamp from ping (optional)
+            
+        Returns:
+            True if publish succeeded
+        """
+        from django.utils import timezone
+        
+        payload: dict[str, Any] = {
+            'ping_id': ping_id,
+            'timestamp': timezone.now().isoformat(),
+            'source': 'hiwavetel_gateway',
+        }
+        if ping_timestamp:
+            payload['ping_timestamp'] = ping_timestamp
+        
+        try:
+            body = json.dumps(payload, ensure_ascii=False)
+            info = self.client.publish(self.topic_health_pong, body, qos=1)  # QoS 1
+            info.wait_for_publish(timeout=5.0)
+            _LOGGER.info('RemoteHiDishelinkClient published health pong ping_id=%s', ping_id)
+            return True
+        except Exception:
+            _LOGGER.exception('RemoteHiDishelinkClient failed to publish health pong ping_id=%s', ping_id)
+            return False
+    
+    def publish_health_heartbeat(self) -> bool:
+        """Publish health heartbeat (tipo A telemetry) to hiDisheLink server.
+        
+        Sends health/ping WITHOUT source:django, with battery_level and/or network_type
+        per section 7 of the spec.
+        
+        Returns:
+            True if publish succeeded
+        """
+        from django.utils import timezone
+        
+        payload = {
+            'timestamp': timezone.now().isoformat(),
+            'battery_level': 100,  # Mock value for gateway (not actual battery)
+            'network_type': 'Ethernet',  # Assumes wired connection
+        }
+        
+        try:
+            body = json.dumps(payload, ensure_ascii=False)
+            info = self.client.publish(self.topic_health_ping, body, qos=1)  # QoS 1
+            info.wait_for_publish(timeout=5.0)
+            _LOGGER.debug('RemoteHiDishelinkClient published health heartbeat')
+            return True
+        except Exception:
+            _LOGGER.exception('RemoteHiDishelinkClient failed to publish health heartbeat')
+            return False
+    
+    def _health_heartbeat_runner(self) -> None:
+        """Periodic health heartbeat thread."""
+        _LOGGER.info(
+            'RemoteHiDishelinkClient health heartbeat started interval=%ss device=%s',
+            self.health_heartbeat_interval,
+            self.device_id,
+        )
+        
+        while not self._heartbeat_stop.wait(timeout=self.health_heartbeat_interval):
+            try:
+                self.publish_health_heartbeat()
+            except Exception:
+                _LOGGER.exception('RemoteHiDishelinkClient health heartbeat tick failed')
+        
+        _LOGGER.debug('RemoteHiDishelinkClient health heartbeat stopped device=%s', self.device_id)

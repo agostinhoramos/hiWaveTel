@@ -162,6 +162,105 @@ class TestSyncSingleInboundToAllDevices:
 
         assert InboxMessage.objects.filter(device=device).count() == 1
 
+    def test_skips_device_when_modem_inbox_mirror_false(self):
+        """Secondary registrations can opt out of modem inbox mirroring."""
+        ExternalDevice.objects.create(
+            device_id='+351913000011',
+            name='Mirror on',
+            status=ExternalDevice.Status.ACTIVE,
+            metadata={},
+        )
+        ExternalDevice.objects.create(
+            device_id='+351913000012',
+            name='Mirror off',
+            status=ExternalDevice.Status.ACTIVE,
+            metadata={'modem_inbox_mirror': False},
+        )
+        InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/mirror_off',
+            modem_index=0,
+            from_number='+351977',
+            text='only one device',
+        )
+        assert InboxMessage.objects.count() == 1
+        assert InboxMessage.objects.filter(device__device_id='+351913000011').exists()
+        assert not InboxMessage.objects.filter(device__device_id='+351913000012').exists()
+
+    def test_skips_mmcli_when_recent_manual_matches_inbound(self):
+        """Avoid inbox_manual plus mmcli duplicate on the same device."""
+        device = ExternalDevice.objects.create(
+            device_id='+351913000013',
+            name='manual first',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        InboxMessage.objects.create(
+            message_id='inbox_manual_pref',
+            device=device,
+            sender='+351966',
+            body='duplicate narrative',
+            received_at=timezone.now(),
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/manual_pref',
+            modem_index=0,
+            from_number='+351966',
+            text='duplicate narrative',
+        )
+        assert InboxMessage.objects.filter(device=device).count() == 1
+        assert not InboxMessage.objects.filter(message_id=f'mmcli_{inbound.pk}_dev_{device.pk}').exists()
+
+    def test_skips_mmcli_on_all_devices_when_manual_on_another_device(self):
+        """Manual inbox on device A prevents mmcli mirror on device B (same sender/body)."""
+        device_a = ExternalDevice.objects.create(
+            device_id='+351913000011',
+            name='A',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        device_b = ExternalDevice.objects.create(
+            device_id='+351913000012',
+            name='B',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        InboxMessage.objects.create(
+            message_id='inbox_manual_other_dev',
+            device=device_a,
+            sender='+351966',
+            body='shared story',
+            received_at=timezone.now(),
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/other_dev',
+            modem_index=0,
+            from_number='+351966',
+            text='shared story',
+        )
+        assert InboxMessage.objects.filter(device=device_a).count() == 1
+        assert InboxMessage.objects.filter(device=device_b).count() == 0
+        assert not InboxMessage.objects.filter(message_id=f'mmcli_{inbound.pk}_dev_{device_b.pk}').exists()
+
+    def test_skips_mmcli_when_inbound_echoes_recent_outbound(self):
+        """Outbound sent via modem must not create extra inbox rows on mirror."""
+        from apps.sms.models import OutboundSms
+
+        device = ExternalDevice.objects.create(
+            device_id='+351913000014',
+            name='echo',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        OutboundSms.objects.create(
+            modem_index=0,
+            to_number='+351977',
+            text='echo body',
+            state=OutboundSms.State.SENT,
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/echo',
+            modem_index=0,
+            from_number='+351977',
+            text='echo body',
+        )
+        assert InboxMessage.objects.filter(device=device).count() == 0
+
 
 class TestPostSaveSignal:
     """Test that post_save signal on InboundSms triggers inbox mirroring."""
@@ -205,6 +304,27 @@ class TestPostSaveSignal:
 
         # Update text — should not create duplicate
         inbound.text = 'Updated'
+        inbound.save()
+
+        assert InboxMessage.objects.filter(device=device).count() == 1
+
+    def test_signal_skips_mirror_until_sender_or_body_present(self):
+        """Empty mmcli snapshot must not create inbox rows; mirror runs once content arrives."""
+        device = ExternalDevice.objects.create(
+            device_id='+351913000099',
+            name='late content',
+            status=ExternalDevice.Status.ACTIVE,
+        )
+        inbound = InboundSms.objects.create(
+            mm_path='/org/freedesktop/ModemManager1/SMS/late',
+            modem_index=0,
+            from_number='',
+            text='',
+        )
+        assert InboxMessage.objects.filter(device=device).count() == 0
+
+        inbound.from_number = '+351988'
+        inbound.text = 'filled later'
         inbound.save()
 
         assert InboxMessage.objects.filter(device=device).count() == 1

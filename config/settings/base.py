@@ -217,6 +217,9 @@ if MQTT_MODEM_STATUS_POLL_INTERVAL_SEC < 0:
     MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
 
 MQTT_SUBSCRIBE_MODEM_CATALOG = truthy_env('MQTT_SUBSCRIBE_MODEM_CATALOG', default=True)
+# Whether the gateway subscribes to the health/ping wildcard at all (telemetry + pong handling).
+# Independent of MQTT_HEALTH_AUTO_PONG: disabling subscription stops telemetry persistence too.
+MQTT_HEALTH_PING_SUBSCRIBE = truthy_env('MQTT_HEALTH_PING_SUBSCRIBE', default=True)
 MQTT_HEALTH_AUTO_PONG = truthy_env('MQTT_HEALTH_AUTO_PONG', default=True)
 MQTT_HEALTH_PING_SUBSCRIBE_QOS = positive_int_env('MQTT_HEALTH_PING_SUBSCRIBE_QOS', 0)
 if MQTT_HEALTH_PING_SUBSCRIBE_QOS > 2:
@@ -256,11 +259,23 @@ try:
 except ValueError:
     MQTT_RECONNECT_JITTER = 0.2
 
-# Gateway MQTT: respond with pong when ping has exact source=django (labs only; Android handles normally)
+# Optional extra / legacy toggle; django tipo B pings also honor MQTT_HEALTH_AUTO_PONG above.
 MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO = truthy_env('MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO', default=False)
 
 # Default SMS inbox flag exposed to Android mqtt-config (`SMS_INBOX_ENABLED`)
 SMS_INBOX_ENABLED_DEFAULT = truthy_env('SMS_INBOX_ENABLED_DEFAULT', default=True)
+
+# Remote hiDisheLink bridge mode settings
+MQTT_REMOTE_BRIDGE_ENABLED = truthy_env('MQTT_REMOTE_BRIDGE_ENABLED', default=True)
+MQTT_LOCAL_BROKER_ENABLED = truthy_env('MQTT_LOCAL_BROKER_ENABLED', default=True)
+
+# Remote client device_id (from HiDishelinkDevice or env)
+MQTT_REMOTE_DEVICE_ID = os.environ.get('MQTT_REMOTE_DEVICE_ID', '').strip()
+
+# Health heartbeat interval (s) for remote broker (tipo A telemetry without source:django)
+MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = positive_int_env('MQTT_REMOTE_HEALTH_HEARTBEAT_SEC', 60)
+if MQTT_REMOTE_HEALTH_HEARTBEAT_SEC <= 0:
+    MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = 60
 
 # MQTT client tuning (mirrors hiDisheLink mqtt-config; optional fallbacks when no remote config)
 MQTT_AUTO_RECONNECT = truthy_env('MQTT_AUTO_RECONNECT', default=True)

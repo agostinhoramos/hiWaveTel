@@ -298,9 +298,10 @@ class TestProcessSmsRequestModemIndex:
         process_sms_request(active_device, ['+351913000111'], 'hello')
         assert OutboundSms.objects.latest('pk').modem_index == 5
 
+    @patch('apps.sms.mmcli_client.resolve_modem_mmcli_index', side_effect=lambda ix, **_: ix)
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
     @override_settings(MODEM_MMCLI_INDEX=8)
-    def test_outbound_falls_back_to_settings_modem_index(self, mock_dispatch, active_device):
+    def test_outbound_falls_back_to_settings_modem_index(self, mock_dispatch, _mock_resolve, active_device):
         def impl(ob):
             ob.state = OutboundSms.State.SENT
             ob.save()
@@ -312,9 +313,10 @@ class TestProcessSmsRequestModemIndex:
         process_sms_request(active_device, ['+351913000222'], 'hello')
         assert OutboundSms.objects.latest('pk').modem_index == 8
 
+    @patch('apps.sms.mmcli_client.resolve_modem_mmcli_index', side_effect=lambda ix, **_: ix)
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
     @override_settings(MODEM_MMCLI_INDEX=3)
-    def test_invalid_metadata_modem_index_falls_back_to_settings(self, mock_dispatch, active_device):
+    def test_invalid_metadata_modem_index_falls_back_to_settings(self, mock_dispatch, _mock_resolve, active_device):
         def impl(ob):
             ob.state = OutboundSms.State.SENT
             ob.save()
@@ -549,6 +551,123 @@ class TestMqttHandlers:
         assert sanitize_device_id('#351913000001') == '351913000001'
         assert sanitize_device_id('+351#913000001') == '351913000001'
 
+    def test_update_request_maps_received_to_processing(self, active_device):
+        """status 'received' must map to PROCESSING (not a terminal state)."""
+        req = SmsRequest.objects.create(
+            request_id='sms_recv_test',
+            device=active_device,
+            recipients=['+351900000001'],
+            message='hello',
+            status=SmsRequest.Status.QUEUED,
+        )
+        update_request_from_mqtt_status(req.request_id, {'status': 'received', 'sent': 0, 'failed': 0, 'details': []})
+        req.refresh_from_db()
+        assert req.status == SmsRequest.Status.PROCESSING
+
+    def test_update_request_maps_partial_and_error(self, active_device):
+        """status 'partial' → PARTIAL; status 'error' → FAILED."""
+        req_partial = SmsRequest.objects.create(
+            request_id='sms_partial_test',
+            device=active_device,
+            recipients=['+1', '+2'],
+            message='hi',
+            status=SmsRequest.Status.PROCESSING,
+        )
+        update_request_from_mqtt_status(
+            req_partial.request_id,
+            {'status': 'partial', 'sent': 1, 'failed': 1, 'details': []},
+        )
+        req_partial.refresh_from_db()
+        assert req_partial.status == SmsRequest.Status.PARTIAL
+        assert req_partial.sent_count == 1
+        assert req_partial.failed_count == 1
+
+        req_error = SmsRequest.objects.create(
+            request_id='sms_error_test',
+            device=active_device,
+            recipients=['+1'],
+            message='hi',
+            status=SmsRequest.Status.PROCESSING,
+        )
+        update_request_from_mqtt_status(
+            req_error.request_id,
+            {'status': 'error', 'sent': 0, 'failed': 1, 'details': []},
+        )
+        req_error.refresh_from_db()
+        assert req_error.status == SmsRequest.Status.FAILED
+
+    def test_update_request_detail_uses_error_key(self, active_device):
+        """details[].error (hiDisheLink spec key) must be stored in SmsRecipientStatus.error_message."""
+        req = SmsRequest.objects.create(
+            request_id='sms_err_key',
+            device=active_device,
+            recipients=['+351900000099'],
+            message='x',
+            status=SmsRequest.Status.PROCESSING,
+        )
+        update_request_from_mqtt_status(req.request_id, {
+            'status': 'error',
+            'sent': 0,
+            'failed': 1,
+            'details': [{'recipient': '+351900000099', 'status': 'failed', 'message_id': '', 'error': 'SMS permission not granted'}],
+        })
+        rs = SmsRecipientStatus.objects.get(request=req, phone_number='+351900000099')
+        assert rs.error_message == 'SMS permission not granted'
+
+    def test_update_request_detail_falls_back_to_error_message(self, active_device):
+        """Legacy clients that send error_message (not error) must still persist correctly."""
+        req = SmsRequest.objects.create(
+            request_id='sms_err_msg_legacy',
+            device=active_device,
+            recipients=['+351900000088'],
+            message='x',
+            status=SmsRequest.Status.PROCESSING,
+        )
+        update_request_from_mqtt_status(req.request_id, {
+            'status': 'error',
+            'sent': 0,
+            'failed': 1,
+            'details': [{'recipient': '+351900000088', 'status': 'failed', 'message_id': '', 'error_message': 'no signal'}],
+        })
+        rs = SmsRecipientStatus.objects.get(request=req, phone_number='+351900000088')
+        assert rs.error_message == 'no signal'
+
+    def test_update_request_skips_empty_recipient_in_details(self, active_device):
+        """Details rows with empty/missing recipient must not create SmsRecipientStatus rows."""
+        req = SmsRequest.objects.create(
+            request_id='sms_skip_empty',
+            device=active_device,
+            recipients=['+1'],
+            message='hi',
+            status=SmsRequest.Status.PROCESSING,
+        )
+        update_request_from_mqtt_status(req.request_id, {
+            'status': 'error',
+            'sent': 0,
+            'failed': 1,
+            'details': [{'recipient': '', 'status': 'failed', 'error': 'SMS permission not granted'}],
+        })
+        assert SmsRecipientStatus.objects.filter(request=req).count() == 0
+
+    def test_update_request_unknown_request_id_noop(self):
+        """Non-existent request_id must return silently without raising."""
+        update_request_from_mqtt_status('sms_does_not_exist', {'status': 'success', 'sent': 1, 'failed': 0, 'details': []})
+
+    def test_persist_inbox_dedup_by_message_id(self, active_device):
+        """Second call with the same message_id must not create a duplicate InboxMessage row."""
+        payload = {
+            'message_id': 'dedup_001',
+            'sender': '+351911000000',
+            'body': 'first body',
+            'timestamp': timezone.now().isoformat(),
+        }
+        msg1 = persist_inbox_from_mqtt(active_device, payload)
+        msg2 = persist_inbox_from_mqtt(active_device, {**payload, 'body': 'second body'})
+        assert msg1.pk == msg2.pk
+        assert InboxMessage.objects.filter(message_id='dedup_001').count() == 1
+        msg1.refresh_from_db()
+        assert msg1.body == 'first body'
+
 
 @pytest.mark.django_db
 class TestServices:
@@ -590,15 +709,15 @@ class TestServices:
         assert sms_request.sent_count == 1
         assert sms_request.failed_count == 0
 
-        mock_mqtt_publish.assert_called_once_with(
-            active_device.device_id,
-            {
-                'request_id': sms_request.request_id,
-                'recipients': ['+351912345678'],
-                'message': 'Test message',
-                'priority': 'normal',
-            },
-        )
+        mock_mqtt_publish.assert_called_once()
+        call_args = mock_mqtt_publish.call_args[0]
+        assert call_args[0] == active_device.device_id
+        payload = call_args[1]
+        assert payload['request_id'] == sms_request.request_id
+        assert payload['recipients'] == ['+351912345678']
+        assert payload['message'] == 'Test message'
+        assert payload['priority'] == 'normal'
+        assert 'timestamp' in payload
 
     @override_settings(MQTT_PUBLISH_SEND_REQUEST=True, MQTT_SEND_RECIPIENTS_CHUNK_SIZE=2)
     @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
@@ -625,13 +744,17 @@ class TestServices:
         assert args1[0] == active_device.device_id
         payload1 = args1[1]
         payload2 = args2[1]
-        assert payload1['chunk_index'] == 1
+        assert payload1['chunk_index'] == 0
         assert payload1['chunk_total'] == 2
         assert payload1['recipients'] == ['+351910000001', '+351910000002']
-        assert payload2['chunk_index'] == 2
+        assert payload2['chunk_index'] == 1
         assert payload2['chunk_total'] == 2
         assert payload2['recipients'] == ['+351910000003']
         assert payload1['request_id'] == sms_request.request_id
+        import re
+        ts_re = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        assert ts_re.match(payload1['timestamp']), f"unexpected timestamp: {payload1.get('timestamp')}"
+        assert ts_re.match(payload2['timestamp']), f"unexpected timestamp: {payload2.get('timestamp')}"
 
     @override_settings(MQTT_PUBLISH_SEND_REQUEST=False)
     @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
@@ -1034,6 +1157,64 @@ class TestInboxMessageAdminAdd:
         assert row.device_id == active_device.device_id
         assert row.message_id.startswith('inbox_manual_')
         assert row.received_at is not None
+
+    def test_admin_add_with_send_checkbox_calls_process_sms_request(self, admin_client, active_device):
+        add_url = reverse('admin:external_device_inboxmessage_add')
+        with patch('apps.external_device.admin.process_sms_request') as mock_proc:
+            mock_proc.return_value = Mock(
+                request_id='rid_inbox_send',
+                status=SmsRequest.Status.COMPLETED,
+                sent_count=1,
+                failed_count=0,
+            )
+            response = admin_client.post(
+                add_url,
+                {
+                    'device': active_device.device_id,
+                    'sender': '+351910000099',
+                    'body': 'reply text',
+                    'also_send_via_modem': 'on',
+                    '_save': 'Save',
+                },
+            )
+        assert response.status_code == 302
+        assert InboxMessage.objects.filter(sender='+351910000099', body='reply text').exists()
+        mock_proc.assert_called_once()
+        kwargs = mock_proc.call_args.kwargs
+        assert kwargs['device'].pk == active_device.pk
+        assert kwargs['recipients'] == ['+351910000099']
+        assert kwargs['message'] == 'reply text'
+        assert kwargs['priority'] == 'normal'
+
+    def test_admin_add_without_send_checkbox_skips_process_sms_request(self, admin_client, active_device):
+        add_url = reverse('admin:external_device_inboxmessage_add')
+        with patch('apps.external_device.admin.process_sms_request') as mock_proc:
+            admin_client.post(
+                add_url,
+                {
+                    'device': active_device.device_id,
+                    'sender': '+351910000088',
+                    'body': 'inbox only',
+                    '_save': 'Save',
+                },
+            )
+        mock_proc.assert_not_called()
+
+    def test_admin_add_send_checkbox_inactive_device_skips_process(self, admin_client, pending_device):
+        add_url = reverse('admin:external_device_inboxmessage_add')
+        with patch('apps.external_device.admin.process_sms_request') as mock_proc:
+            admin_client.post(
+                add_url,
+                {
+                    'device': pending_device.device_id,
+                    'sender': '+351910000077',
+                    'body': 'try send',
+                    'also_send_via_modem': 'on',
+                    '_save': 'Save',
+                },
+            )
+        mock_proc.assert_not_called()
+        assert InboxMessage.objects.filter(sender='+351910000077').exists()
 
     def test_save_model_generates_message_id_when_blank(self, rf, active_device):
         User = get_user_model()

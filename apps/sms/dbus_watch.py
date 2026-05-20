@@ -15,7 +15,8 @@ import dbus_next.message_bus as _dbus_mb
 
 from django.db import DatabaseError, IntegrityError
 
-from .mmcli_client import MMCLIClient, MmcliError
+from .mmcli_client import MMCLIClient, MmcliError, resolve_modem_mmcli_index
+from .modem_ready import try_enable_modem as _try_enable_modem
 from .queue_processor import get_sms_queue
 from .services import persist_inbound_sms
 
@@ -135,39 +136,6 @@ def _make_on_added_callback(modem_index: int):
     return _on_added
 
 
-def _try_enable_modem(modem_index: int) -> None:
-    """Attempt to enable the modem via mmcli if it appears disabled.
-
-    Called from a thread executor so it doesn't block the asyncio event loop.
-    Failures are logged but not raised — the caller continues retrying.
-    """
-    import subprocess as _sp
-    mmcli_path = os.environ.get('MMCLI_PATH', 'mmcli')
-    try:
-        state_cp = _sp.run(
-            [mmcli_path, '-m', str(modem_index)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if 'state: disabled' in state_cp.stdout or 'state: disabled' in state_cp.stderr:
-            _LOGGER.info('Modem %s is disabled — attempting mmcli --enable ...', modem_index)
-            en_cp = _sp.run(
-                [mmcli_path, '-m', str(modem_index), '--enable'],
-                capture_output=True, text=True, timeout=30,
-            )
-            if en_cp.returncode == 0:
-                _LOGGER.info('mmcli --enable modem %s succeeded', modem_index)
-            else:
-                _LOGGER.warning(
-                    'mmcli --enable modem %s failed (rc=%s): %s',
-                    modem_index, en_cp.returncode,
-                    (en_cp.stderr or en_cp.stdout or '').strip()[:200],
-                )
-        else:
-            _LOGGER.debug('Modem %s state check: not disabled; skipping enable attempt', modem_index)
-    except Exception as exc:
-        _LOGGER.warning('_try_enable_modem(%s) error: %s', modem_index, exc)
-
-
 async def run_modem_added_listener(
     modem_index: int,
     reconnect_after: float,
@@ -176,9 +144,21 @@ async def run_modem_added_listener(
 ) -> None:
     """Subscribe to Modem.Messaging `Added`, persisting inbound SMS asynchronously."""
 
-    path = modem_object_path(modem_index)
+    configured_index = modem_index
 
     while True:
+        loop = asyncio.get_running_loop()
+        try:
+            modem_index = await loop.run_in_executor(
+                None,
+                lambda: resolve_modem_mmcli_index(configured_index),
+            )
+        except MmcliError as exc:
+            _LOGGER.warning('SMS watcher: cannot resolve modem index (%s): %s', configured_index, exc)
+            await asyncio.sleep(reconnect_after)
+            continue
+
+        path = modem_object_path(modem_index)
         bus: MessageBus | None = None
         try:
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()

@@ -33,12 +33,50 @@ ensure_sqlite_file() {
   fi
 }
 
-# True when SIM reports PIN lock per mmcli (skip unnecessary --pin when already usable).
+# True when the modem overview reports SIM PIN lock (mmcli -m).
+_modem_needs_sim_unlock() {
+  local modem_path="$1"
+  [[ -n "${modem_path}" ]] || return 1
+  mmcli -m "${modem_path}" 2>/dev/null | grep -qiE \
+    '(^|[[:space:]])state:[[:space:]]*locked|lock:[[:space:]]*sim-pin|enabled locks:.*sim'
+}
+
+# True when SIM object reports PIN lock per mmcli -i (skip --pin when already usable).
 _sim_is_locked() {
   local sim_path="$1"
   [[ -n "${sim_path}" ]] || return 1
   mmcli -i "${sim_path}" 2>/dev/null | grep -qiE \
-    'SIM lock status:[[:space:]]*sim-pin|unlock required:[[:space:]]*sim-pin|lock:[[:space:]]*sim-pin'
+    'SIM lock status:[[:space:]]*sim-pin|unlock required:[[:space:]]*sim-pin|lock:[[:space:]]*sim-pin|state:[[:space:]]*locked'
+}
+
+_needs_sim_pin_unlock() {
+  local modem_path="$1"
+  local sim_path="$2"
+  _modem_needs_sim_unlock "${modem_path}" && return 0
+  [[ -n "${sim_path}" ]] && _sim_is_locked "${sim_path}" && return 0
+  return 1
+}
+
+_try_unlock_sim_pin() {
+  local modem_path="$1"
+  local sim_path="$2"
+  local pin="$3"
+  local rc=1
+  if [[ -n "${sim_path}" ]]; then
+    echo "SIM unlock: mmcli -i ${sim_path} --pin=***"
+    if mmcli -i "${sim_path}" --pin="${pin}" 2>&1; then
+      return 0
+    fi
+    rc=$?
+  fi
+  if [[ -n "${modem_path}" ]]; then
+    echo "SIM unlock: mmcli -m ${modem_path} --pin=*** (fallback)"
+    if mmcli -m "${modem_path}" --pin="${pin}" 2>&1; then
+      return 0
+    fi
+    rc=$?
+  fi
+  return "${rc}"
 }
 
 # Prefer ModemManager /modem and SIM reported by mmcli (avoids always assuming .../SIM/0).
@@ -105,6 +143,14 @@ modem_preflight() {
 }
 
 modem_preflight
+
+# network_mode: host — host ModemManager must not hold the same USB modem as in-container MM.
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl is-active --quiet ModemManager 2>/dev/null; then
+    echo 'WARNING: host ModemManager.service is active — stop it or the container modem stays locked/unusable:' >&2
+    echo '  sudo systemctl stop ModemManager NetworkManager' >&2
+  fi
+fi
 
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/run/dbus/system_bus_socket}"
 
@@ -221,32 +267,6 @@ MODEM_DBUS=""
 SIM_DETECT=""
 if [[ "${FOUND}" == "1" ]]; then
   MODEM_DBUS="$(mmcli_primary_modem_dbuss_path)"
-
-  # Enable modem if in disabled state, then wait for enabled/registered so that
-  # mmcli --messaging-create-sms doesn't fail with "modem not enabled yet".
-  if [[ -n "${MODEM_DBUS}" ]]; then
-    MODEM_ENABLE_WAIT_SEC="${MODEM_ENABLE_WAIT_SEC:-20}"
-    _modem_state_check() { mmcli -m "${MODEM_DBUS}" 2>/dev/null | grep -oE 'state:[[:space:]]*[a-z]+' | head -n1 | grep -oE '[a-z]+$' || echo 'unknown'; }
-
-    _initial_state="$(_modem_state_check)"
-    echo "modem ${MODEM_DBUS} initial state: ${_initial_state}"
-
-    if [[ "${_initial_state}" == "disabled" ]]; then
-      echo "modem ${MODEM_DBUS} is disabled --- enabling (mmcli --enable) ..."
-      mmcli -m "${MODEM_DBUS}" --enable 2>&1 || echo "warning: mmcli --enable failed (continuing)." >&2
-    fi
-
-    echo "Waiting for ${MODEM_DBUS} to become enabled or registered (timeout ${MODEM_ENABLE_WAIT_SEC}s) ..."
-    for _ in $(seq 1 "${MODEM_ENABLE_WAIT_SEC}"); do
-      _cur="$(_modem_state_check)"
-      if [[ "${_cur}" == "enabled" || "${_cur}" == "registered" ]]; then
-        echo "modem ${MODEM_DBUS} state=${_cur} --- ready for SMS."
-        break
-      fi
-      sleep 1
-    done
-  fi
-
   [[ -z "${MODEM_DBUS:-}" ]] || SIM_DETECT="$(mmcli_primary_sim_dbuss_path "${MODEM_DBUS}")" || true
 fi
 
@@ -264,27 +284,77 @@ elif [[ -n "${SIM_EXPLICIT}" ]]; then
   SIM="${SIM_EXPLICIT}"
 fi
 
-if [[ "${FOUND}" == "1" && -n "${PIN}" && -n "${SIM}" ]]; then
-  if [[ "${SIM}" == "${SIM_DETECT}" ]] && [[ -n "${SIM_DETECT}" ]]; then
-    _sim_src="mmcli"
-  elif truthy "${SIM_PATH_OVERRIDES_MMCLI:-false}" && [[ "${SIM}" == "${SIM_EXPLICIT}" ]]; then
-    _sim_src="SIM_PATH+override"
-  else
-    _sim_src="SIM_PATH"
+if [[ "${FOUND}" == "1" && -n "${MODEM_DBUS:-}" ]]; then
+  _modem_state_check() {
+    mmcli -m "${MODEM_DBUS}" 2>/dev/null | grep -oE 'state:[[:space:]]*[a-z]+' | head -n1 | grep -oE '[a-z]+$' || echo 'unknown'
+  }
+  _initial_state="$(_modem_state_check)"
+  echo "modem ${MODEM_DBUS} initial state: ${_initial_state}"
+
+  # Unlock SIM PIN before enable/wait — a locked modem never reaches enabled/registered.
+  if [[ -n "${PIN}" ]]; then
+    if _needs_sim_pin_unlock "${MODEM_DBUS}" "${SIM:-}"; then
+      if [[ "${SIM}" == "${SIM_DETECT}" ]] && [[ -n "${SIM_DETECT}" ]]; then
+        _sim_src="mmcli"
+      elif truthy "${SIM_PATH_OVERRIDES_MMCLI:-false}" && [[ "${SIM}" == "${SIM_EXPLICIT}" ]]; then
+        _sim_src="SIM_PATH+override"
+      elif [[ -n "${SIM}" ]]; then
+        _sim_src="SIM_PATH"
+      else
+        _sim_src="modem"
+      fi
+      echo "SIM unlock (${_sim_src}): modem=${MODEM_DBUS} SIM=${SIM:-n/a} (locked)"
+      if ! _try_unlock_sim_pin "${MODEM_DBUS}" "${SIM:-}" "${PIN}"; then
+        echo "PIN: unlock failed (check DEVICE_PIN_CODE in .env)." >&2
+      else
+        echo "PIN: unlock succeeded."
+        sleep 2
+      fi
+    else
+      echo "SIM unlock: skipped (modem/SIM not reporting SIM-PIN lock)."
+    fi
+  elif _modem_needs_sim_unlock "${MODEM_DBUS}"; then
+    echo "Modem reports SIM-PIN lock but DEVICE_PIN_CODE is empty — set PIN in .env." >&2
   fi
-  if _sim_is_locked "${SIM}"; then
-    echo "SIM unlock (${_sim_src}): modem=${MODEM_DBUS:-?} SIM=${SIM} (locked)"
-    mmcli -i "${SIM}" --pin="${PIN}" || echo "PIN: unlock failed."
-  else
-    echo "SIM unlock (${_sim_src}): skipped (SIM not SIM-PIN locked or already usable)."
+
+  # Enable modem if disabled, then wait for enabled/registered (mmcli --messaging-create-sms).
+  if [[ -n "${MODEM_DBUS}" ]]; then
+    MODEM_ENABLE_WAIT_SEC="${MODEM_ENABLE_WAIT_SEC:-20}"
+    _cur_state="$(_modem_state_check)"
+    if [[ "${_cur_state}" == "disabled" ]]; then
+      echo "modem ${MODEM_DBUS} is disabled --- enabling (mmcli --enable) ..."
+      mmcli -m "${MODEM_DBUS}" --enable 2>&1 || echo "warning: mmcli --enable failed (continuing)." >&2
+    fi
+
+    echo "Waiting for ${MODEM_DBUS} to become enabled or registered (timeout ${MODEM_ENABLE_WAIT_SEC}s) ..."
+    for _ in $(seq 1 "${MODEM_ENABLE_WAIT_SEC}"); do
+      _cur="$(_modem_state_check)"
+      if [[ "${_cur}" == "enabled" || "${_cur}" == "registered" ]]; then
+        echo "modem ${MODEM_DBUS} state=${_cur} --- ready for SMS."
+        break
+      fi
+      sleep 1
+    done
+    _final_state="$(_modem_state_check)"
+    if [[ "${_final_state}" != "enabled" && "${_final_state}" != "registered" ]]; then
+      echo "warning: modem ${MODEM_DBUS} still state=${_final_state} after ${MODEM_ENABLE_WAIT_SEC}s (SMS/Messaging may fail)." >&2
+    fi
   fi
 elif [[ "${FOUND}" != "1" ]] && ([[ -n "${PIN}" ]] || [[ -n "${SIM_EXPLICIT}" ]] || [[ -n "${SIM_DETECT}" ]]); then
   echo 'Skipping PIN/SIM unlock: modem not enumerated yet.'
-elif [[ "${FOUND}" == "1" && -n "${PIN}" && -z "${SIM}" ]]; then
-  echo "PIN set (${DEVICE_PIN_CODE:+present}) but no SIM object reported by mmcli (modem ${MODEM_DBUS:-unknown})." >&2
-  echo "  Check SIM slot/card; or set SIM_PATH explicitly." >&2
+elif [[ "${FOUND}" == "1" && -n "${PIN}" && -z "${MODEM_DBUS:-}" ]]; then
+  echo "PIN set but no modem path from mmcli -L." >&2
 elif [[ "${FOUND}" == "1" && -z "${PIN}" ]] && [[ -n "${SIM_EXPLICIT}" ]]; then
   echo "SIM_PATH set without DEVICE_PIN_CODE: no unlock attempt (normal if SIM is not PIN-locked)." >&2
+fi
+
+# After unlock/enable the modem object path often changes (e.g. Modem/0 → Modem/1); re-detect.
+if [[ "${FOUND}" == "1" ]]; then
+  _mp_after="$(mmcli_primary_modem_dbuss_path)"
+  if [[ -n "${_mp_after}" ]]; then
+    MODEM_DBUS="${_mp_after}"
+    echo "modem path after unlock/enable: ${MODEM_DBUS}"
+  fi
 fi
 
 ensure_sqlite_file "${SQLITE_DB_PATH:-}"
@@ -310,6 +380,11 @@ if truthy "${AUTO_DETECT_MMCLI_INDEX:-true}" && [[ -n "${DETECT_MMCLI_INDEX}" ]]
 elif [[ -n "${DETECT_MMCLI_INDEX}" ]]; then
   echo "MODEM_MMCLI_INDEX manual: ${MODEM_MMCLI_INDEX:-0} (would auto-detect as ${DETECT_MMCLI_INDEX}; set AUTO_DETECT_MMCLI_INDEX=true to align)."
 fi
+
+MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"
+mkdir -p /etc/profile.d
+printf 'export MODEM_MMCLI_INDEX=%s\n' "${MODEM_MMCLI_INDEX}" > /etc/profile.d/hiwavetel-modem.sh
+echo "Interactive shells: MODEM_MMCLI_INDEX=${MODEM_MMCLI_INDEX} (see /etc/profile.d/hiwavetel-modem.sh)."
 
 if truthy "${RUN_SMS_WATCHER:-}"; then
   MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"

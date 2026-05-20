@@ -30,6 +30,53 @@ from .models import (
 _LOGGER = logging.getLogger(__name__)
 
 
+_MANUAL_INBOX_DEDUP_MINUTES = 15
+
+
+def _recent_manual_inbox_matches_inbound(inbound) -> bool:
+    """True when any device has a recent manual admin inbox row for this sender/body."""
+    sender = (inbound.from_number or '').strip()
+    body = (inbound.text or '').strip()
+    if not sender or not body:
+        return False
+    cutoff = timezone.now() - timedelta(minutes=_MANUAL_INBOX_DEDUP_MINUTES)
+    return InboxMessage.objects.filter(
+        message_id__startswith='inbox_manual_',
+        sender=sender,
+        body=body,
+        received_at__gte=cutoff,
+    ).exists()
+
+
+def _inbound_likely_outbound_echo(inbound) -> bool:
+    """True when modem inbox likely echoes a recent outbound send (admin «also send via modem»)."""
+    body = (inbound.text or '').strip()
+    if not body:
+        return False
+    cutoff = timezone.now() - timedelta(minutes=_MANUAL_INBOX_DEDUP_MINUTES)
+    qs = OutboundSms.objects.filter(
+        state=OutboundSms.State.SENT,
+        text=body,
+        created_at__gte=cutoff,
+    )
+    sender = (inbound.from_number or '').strip()
+    if sender:
+        qs = qs.filter(to_number=sender)
+    return qs.exists()
+
+
+def inbound_should_skip_modem_mirror(inbound) -> bool:
+    """Whether ``sync_single_inbound_to_all_devices`` should ignore this InboundSms."""
+    if _inbound_likely_outbound_echo(inbound):
+        return True
+    return _recent_manual_inbox_matches_inbound(inbound)
+
+
+def inbound_ready_for_inbox_mirror(inbound) -> bool:
+    """Wait until mmcli snapshot has sender or body before mirroring (avoids empty duplicates)."""
+    return bool((inbound.text or '').strip()) or bool((inbound.from_number or '').strip())
+
+
 def modem_index_for_external_device(device: ExternalDevice) -> int:
     """Modem index for ``mmcli -m N`` when sending on behalf of an external device.
 
@@ -48,7 +95,9 @@ def modem_index_for_external_device(device: ExternalDevice) -> int:
                 device.device_id,
                 raw,
             )
-    return int(getattr(settings, 'MODEM_MMCLI_INDEX', 0))
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+
+    return resolve_modem_mmcli_index(int(getattr(settings, 'MODEM_MMCLI_INDEX', 0)))
 
 
 def generate_token(length: int = 48) -> str:
@@ -229,12 +278,13 @@ def process_sms_request(
 
             for i in range(0, len(recips), chunk_sz):
                 chunk = recips[i : i + chunk_sz]
-                chunk_index = i // chunk_sz + 1
+                chunk_index = i // chunk_sz  # 0-based per hiDisheLink spec §7.3
                 mqtt_payload: dict[str, Any] = {
                     'request_id': request_id,
                     'recipients': chunk,
                     'message': message,
                     'priority': priority,
+                    'timestamp': timezone.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
                 }
                 if total_chunks > 1:
                     mqtt_payload['chunk_index'] = chunk_index
@@ -303,7 +353,7 @@ def update_request_from_mqtt_status(request_id: str, payload: dict[str, Any]) ->
             recipient = detail.get('recipient', '')
             status_str = detail.get('status', 'failed')
             message_id = detail.get('message_id', '')
-            error_msg = detail.get('error_message', '')
+            error_msg = detail.get('error') or detail.get('error_message', '')
 
             if not recipient:
                 continue
@@ -511,6 +561,23 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> tuple[bool, bool, bool
     )
 
     metadata = device.metadata or {}
+
+    if metadata.get('modem_inbox_mirror') is False:
+        _LOGGER.debug(
+            'sync_single_inbound_to_all_devices: skipping device=%s (metadata.modem_inbox_mirror=false)',
+            device.device_id,
+        )
+        return (False, True, False)
+
+    if inbound_should_skip_modem_mirror(inbound):
+        _LOGGER.info(
+            'sync_single_inbound_to_all_devices: skipping mmcli mirror device=%s inbound_pk=%s '
+            '(recent manual inbox or outbound echo)',
+            device.device_id,
+            inbound.pk,
+        )
+        return (False, True, False)
+
     device_modem_index = metadata.get('modem_index')
 
     if device_modem_index is not None:
@@ -590,7 +657,7 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> tuple[bool, bool, bool
 
 
 def sync_single_inbound_to_all_devices(inbound) -> None:
-    """Mirror a single InboundSms to all active ExternalDevices.
+    """Mirror a single InboundSms to active ExternalDevices.
 
     Called by the post_save signal when InboundSms is created.
     Processes devices sequentially — SQLite does not support concurrent
@@ -598,9 +665,14 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
     prevent "database table is locked" errors.
 
     For each active device:
-    - If device.metadata['modem_index'] is set, only mirror when it matches
-      inbound.modem_index.
-    - If device.metadata['modem_index'] is not set, mirror unconditionally.
+
+    - Skips when ``device.metadata['modem_inbox_mirror'] is False`` (use on
+      secondary registrations that should not receive the same mmcli mirror).
+    - Skips when any recent ``inbox_manual_*`` row has the same sender/body, or when
+      the inbound likely echoes a recent outbound send (admin manual + modem send).
+    - If ``device.metadata['modem_index']`` is set, only mirror when it matches
+      ``inbound.modem_index``.
+    - If ``modem_index`` is not set, mirror unconditionally (subject to the rules above).
     """
     active_devices = list(ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE))
     active_count = len(active_devices)
@@ -740,3 +812,222 @@ def delete_external_device_and_dependencies(device: ExternalDevice) -> dict[str,
         stats,
     )
     return stats
+
+
+# Remote hiDisheLink bridge handlers (section 10 of hiDisheLink architecture doc)
+
+
+def handle_remote_sms_send(remote_client, payload: dict[str, Any]) -> None:
+    """Handle SMS send request from remote hiDisheLink broker (section 10 handler).
+    
+    Implements the contract from section 10.10 (checklist item 3-4):
+    1. Validate payload
+    2. Publish ACK imediato: status=received
+    3. Agregar chunks se chunk_index/chunk_total presentes
+    4. Dispatch via mmcli para cada recipient
+    5. Publicar status final: success/partial/error com details[]
+    
+    Args:
+        remote_client: RemoteHiDishelinkClient instance
+        payload: SMS send payload from hiDisheLink server
+    """
+    from typing import TYPE_CHECKING
+    if TYPE_CHECKING:
+        from .mqtt_client import RemoteHiDishelinkClient
+        remote_client: RemoteHiDishelinkClient
+    
+    request_id = payload.get('request_id', '').strip()
+    if not request_id:
+        _LOGGER.warning('Remote SMS send missing request_id: %s', payload)
+        return
+    
+    _LOGGER.info('Remote SMS send received request_id=%s', request_id)
+    
+    # Step 1: Validate payload
+    recipients = payload.get('recipients')
+    if not isinstance(recipients, list) or not recipients:
+        _LOGGER.warning('Remote SMS send invalid/empty recipients request_id=%s', request_id)
+        remote_client.publish_sms_status(
+            request_id,
+            'error',
+            {
+                'sent': 0,
+                'failed': 0,
+                'details': [{'status': 'failed', 'error': 'Invalid or empty recipients list'}],
+            },
+        )
+        return
+    
+    message = payload.get('message', '').strip()
+    if not message:
+        _LOGGER.warning('Remote SMS send missing message request_id=%s', request_id)
+        remote_client.publish_sms_status(
+            request_id,
+            'error',
+            {
+                'sent': 0,
+                'failed': 0,
+                'details': [{'status': 'failed', 'error': 'Missing message text'}],
+            },
+        )
+        return
+    
+    # Step 2: Publish ACK imediato (status=received)
+    remote_client.publish_sms_status(
+        request_id,
+        'received',
+        {},  # Minimal payload for received ACK
+    )
+    
+    # Step 3: Handle chunking (if present)
+    # For now, process immediately. Chunking aggregation will be implemented in to-do #4
+    chunk_index = payload.get('chunk_index')
+    chunk_total = payload.get('chunk_total')
+    if chunk_index is not None and chunk_total is not None:
+        _LOGGER.info(
+            'Remote SMS send chunked request_id=%s chunk=%s/%s recipients=%s',
+            request_id,
+            chunk_index,
+            chunk_total,
+            len(recipients),
+        )
+        # TODO: Implement buffering and aggregation (to-do #4: chunking-aggregation)
+        # For now, process each chunk immediately
+    
+    # Step 4: Dispatch via mmcli para cada recipient
+    details = []
+    sent_count = 0
+    failed_count = 0
+    
+    # Determine modem index (use default from settings)
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+    modem_idx = resolve_modem_mmcli_index(int(getattr(settings, 'MODEM_MMCLI_INDEX', 0)))
+    
+    for recipient in recipients:
+        recipient_num = str(recipient).strip()
+        if not recipient_num:
+            details.append({
+                'recipient': recipient_num,
+                'status': 'failed',
+                'error': 'Empty recipient number',
+            })
+            failed_count += 1
+            continue
+        
+        try:
+            # Create OutboundSms
+            outbound = OutboundSms.objects.create(
+                modem_index=modem_idx,
+                to_number=recipient_num,
+                text=message,
+                state=OutboundSms.State.CREATED,
+            )
+            
+            # Dispatch via mmcli
+            dispatch_outbound_mmcli(outbound)
+            
+            # Reload to get updated state
+            outbound.refresh_from_db()
+            
+            if outbound.state == OutboundSms.State.SENT:
+                details.append({
+                    'recipient': recipient_num,
+                    'status': 'sent',
+                    'message_id': outbound.mm_path or f'outbound_{outbound.pk}',
+                })
+                sent_count += 1
+            else:
+                details.append({
+                    'recipient': recipient_num,
+                    'status': 'failed',
+                    'error': outbound.error_message or 'Unknown error',
+                })
+                failed_count += 1
+        
+        except Exception as exc:
+            _LOGGER.exception('Remote SMS dispatch failed recipient=%s request_id=%s', recipient_num, request_id)
+            details.append({
+                'recipient': recipient_num,
+                'status': 'failed',
+                'error': str(exc)[:200],
+            })
+            failed_count += 1
+    
+    # Step 5: Publicar status final
+    if failed_count == 0:
+        final_status = 'success'
+    elif sent_count == 0:
+        final_status = 'error'
+    else:
+        final_status = 'partial'
+    
+    remote_client.publish_sms_status(
+        request_id,
+        final_status,
+        {
+            'sent': sent_count,
+            'failed': failed_count,
+            'details': details,
+        },
+    )
+    
+    _LOGGER.info(
+        'Remote SMS send completed request_id=%s status=%s sent=%s failed=%s',
+        request_id,
+        final_status,
+        sent_count,
+        failed_count,
+    )
+
+
+def publish_inbound_to_remote(inbound, remote_client) -> bool:
+    """Publish InboundSms to remote hiDisheLink broker (section 6 of spec).
+    
+    Called from post_save signal when bridge mode is enabled.
+    Implements inbox publishing per section 10.10 (checklist item 7).
+    
+    Args:
+        inbound: InboundSms instance
+        remote_client: RemoteHiDishelinkClient instance
+        
+    Returns:
+        True if published successfully
+    """
+    from typing import TYPE_CHECKING
+    if TYPE_CHECKING:
+        from .mqtt_client import RemoteHiDishelinkClient
+        remote_client: RemoteHiDishelinkClient
+    
+    # Skip if not ready (no sender or body yet)
+    if not inbound_ready_for_inbox_mirror(inbound):
+        _LOGGER.debug('Inbound SMS not ready for remote publish pk=%s', inbound.pk)
+        return False
+    
+    # Skip if should be filtered (echo or manual duplicate)
+    if inbound_should_skip_modem_mirror(inbound):
+        _LOGGER.debug('Inbound SMS skipped for remote publish pk=%s (dedup filter)', inbound.pk)
+        return False
+    
+    # Generate message_id
+    message_id = f'hidw_inbound_{inbound.pk}_{inbound.modem_index}'
+    sender = inbound.from_number or ''
+    body = inbound.text or ''
+    timestamp = inbound.created_at.isoformat()
+    
+    success = remote_client.publish_sms_inbox(message_id, sender, body, timestamp)
+    
+    if success:
+        _LOGGER.info(
+            'Published InboundSms to remote broker pk=%s message_id=%s sender=%s',
+            inbound.pk,
+            message_id,
+            sender,
+        )
+    else:
+        _LOGGER.warning(
+            'Failed to publish InboundSms to remote broker pk=%s message_id=%s',
+            inbound.pk,
+            message_id,
+        )
+    
+    return success

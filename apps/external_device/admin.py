@@ -73,6 +73,25 @@ class ExternalDeviceSmsForm(forms.Form):
     )
 
 
+class InboxMessageAddForm(forms.ModelForm):
+    """Add-only form with optional outbound SMS dispatch."""
+
+    also_send_via_modem = forms.BooleanField(
+        required=False,
+        initial=False,
+        label=_('Also send via modem'),
+        help_text=_(
+            'If checked, sends this message text as an outbound SMS to the Sender phone number '
+            'using the selected gateway device (same pipeline as POST /api/v1/sms/send/). '
+            'The device must be Active.'
+        ),
+    )
+
+    class Meta:
+        model = InboxMessage
+        fields = ('device', 'sender', 'body', 'ack_sent')
+
+
 class HiDishelinkMqttPublishForm(forms.Form):
     topic = forms.CharField(max_length=1024)
     payload_json = forms.CharField(
@@ -121,6 +140,12 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
     fieldsets = (
         ('Device Info', {
             'fields': ('device_id', 'name', 'device_type', 'mqtt_client_id', 'metadata'),
+            'description': format_html(
+                'Optional JSON metadata. Use <code>"modem_index": N</code> to tie this device to '
+                'one ModemManager modem. If several ExternalDevices share the same modem but only '
+                'one should receive mirrored inbox SMS, set '
+                '<code>"modem_inbox_mirror": false</code> on the others.'
+            ),
         }),
         ('Authentication', {
             'fields': ('api_key_hash', 'registration_token_hash', 'registration_token_expires_at'),
@@ -130,7 +155,8 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
         }),
         ('SMS inbox (MQTT / modem mirror)', {
             'fields': ('device_inbox_preview',),
-            'description': 'Recent rows from InboxMessage for this device. Use “Sync inbox from modem” on the changelist to refresh from server modem store.',
+            'description': 'Recent rows from InboxMessage for this device. Use “Sync inbox from modem” on the changelist to refresh from server modem store. '
+            'Duplicate mmcli mirrors across devices are avoided by setting `"modem_inbox_mirror": false` in metadata on secondary devices.',
         }),
         ('Limits', {
             'fields': ('max_recipients_per_request', 'daily_sms_limit'),
@@ -830,10 +856,10 @@ class InboxMessageAdmin(admin.ModelAdmin):
                         'description': _(
                             'Pick the gateway device this inbound SMS belongs to, the sender '
                             'contact number, and the message text. Message ID and received time '
-                            'are assigned automatically. '
-                            'This only stores a row in the inbox; it does not send SMS over the modem.'
+                            'are assigned automatically. By default only the inbox row is stored; '
+                            'use «Also send via modem» to dispatch the same text to the Sender number.'
                         ),
-                        'fields': ('device', 'sender', 'body', 'ack_sent'),
+                        'fields': ('device', 'sender', 'body', 'ack_sent', 'also_send_via_modem'),
                     },
                 ),
                 (
@@ -847,6 +873,11 @@ class InboxMessageAdmin(admin.ModelAdmin):
         if obj is None:
             return ('message_id', 'received_at')
         return super().get_exclude(request, obj) or ()
+
+    def get_form(self, request, obj=None, change=False, **kwargs):  # type: ignore[override]
+        if obj is None and not change:
+            kwargs.setdefault('form', InboxMessageAddForm)
+        return super().get_form(request, obj, change=change, **kwargs)
 
     def get_readonly_fields(self, request, obj=None):  # type: ignore[override]
         """Allow operators to fill canonical fields when adding; keep rows immutable after save."""
@@ -862,3 +893,107 @@ class InboxMessageAdmin(admin.ModelAdmin):
             if obj.received_at is None:
                 obj.received_at = timezone.now()
         super().save_model(request, obj, form, change)
+
+        if change or form is None or not hasattr(form, 'cleaned_data'):
+            return
+        if not form.cleaned_data.get('also_send_via_modem'):
+            return
+
+        device = obj.device
+        if device.status != ExternalDevice.Status.ACTIVE:
+            self.message_user(
+                request,
+                _(
+                    'Inbox row was saved; SMS was not sent because the gateway device is not Active.'
+                ),
+                level=messages.WARNING,
+            )
+            return
+
+        recipient = (obj.sender or '').strip()
+        if not recipient:
+            self.message_user(
+                request,
+                _('Inbox row was saved; SMS was not sent because Sender is empty.'),
+                level=messages.WARNING,
+            )
+            return
+
+        try:
+            sms_request = process_sms_request(
+                device=device,
+                recipients=[recipient],
+                message=obj.body,
+                priority='normal',
+            )
+        except DRFValidationError as exc:
+            detail = getattr(exc, 'detail', exc)
+            if isinstance(detail, dict):
+                msg = '; '.join(f'{k}: {detail[k]}' for k in sorted(detail))
+            else:
+                msg = str(detail)
+            self.message_user(request, msg, level=messages.ERROR)
+            return
+
+        rid = sms_request.request_id
+        st = sms_request.status
+        sent_n = sms_request.sent_count
+        fail_n = sms_request.failed_count
+        if st == SmsRequest.Status.FAILED:
+            fail_detail = ''
+            rs = (
+                SmsRecipientStatus.objects.filter(request=sms_request)
+                .exclude(error_message='')
+                .order_by('id')
+                .first()
+            )
+            if rs and rs.error_message:
+                fail_detail = rs.error_message
+            if fail_detail:
+                self.message_user(
+                    request,
+                    format_html(
+                        'SMS dispatch for this row: nothing sent (<code>{}</code>, {} failed). '
+                        'Modem/mmcli: <strong>{}</strong>. '
+                        'If the modem was disabled, retry after it shows enabled in mmcli; '
+                        'otherwise check MODEM_MMCLI_INDEX or device metadata '
+                        '<code>modem_index</code>.',
+                        rid,
+                        fail_n,
+                        fail_detail,
+                    ),
+                    level=messages.ERROR,
+                )
+            else:
+                self.message_user(
+                    request,
+                    format_html(
+                        'SMS dispatch for this row: nothing sent (<code>{}</code>, {} failed). '
+                        'Check OutboundSms / mmcli; MODEM_MMCLI_INDEX or device metadata '
+                        '<code>modem_index</code>.',
+                        rid,
+                        fail_n,
+                    ),
+                    level=messages.ERROR,
+                )
+        elif st == SmsRequest.Status.PARTIAL:
+            self.message_user(
+                request,
+                format_html(
+                    'SMS dispatch for this row: partial success <code>{}</code> — sent {}, failed {}.',
+                    rid,
+                    sent_n,
+                    fail_n,
+                ),
+                level=messages.WARNING,
+            )
+        else:
+            self.message_user(
+                request,
+                format_html(
+                    'SMS also sent: request <code>{}</code> — {} recipient(s) ok.',
+                    rid,
+                    sent_n,
+                ),
+                level=messages.SUCCESS,
+            )

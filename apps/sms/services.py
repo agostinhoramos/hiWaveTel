@@ -22,6 +22,8 @@ from .mmcli_client import (
     extract_text,
     extract_timestamp,
 )
+from .mmcli_client import resolve_modem_mmcli_index
+from .modem_ready import prepare_modem_for_outbound_sms
 from .models import InboundSms, OutboundSms
 
 _LOGGER = logging.getLogger(__name__)
@@ -190,8 +192,16 @@ def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None
 
     mm = client or MMCLIClient()
     try:
-        mm.ensure_modem_index(outbound.modem_index)
-        sms_path = mm.create_sms(outbound.modem_index, outbound.to_number, outbound.text)
+        modem_ix = outbound.modem_index
+        if client is None:
+            modem_ix = resolve_modem_mmcli_index(modem_ix, client=mm)
+            if modem_ix != outbound.modem_index:
+                outbound.modem_index = modem_ix
+                outbound.save(update_fields=('modem_index',))
+            prepare_modem_for_outbound_sms(modem_ix, mmcli_path=mm.mmcli_path)
+        else:
+            mm.ensure_modem_index(modem_ix)
+        sms_path = mm.create_sms(modem_ix, outbound.to_number, outbound.text)
         outbound.mm_path = sms_path
         outbound.state = OutboundSms.State.SENDING
         outbound.save(update_fields=('mm_path', 'state'))

@@ -146,6 +146,21 @@ class MMCLIClient:
         haystack = (cp.stdout or "") + "\n" + (cp.stderr or "")
         return sorted({int(x) for x in _modem_path_re.findall(haystack)})
 
+    def primary_modem_index(self) -> int:
+        """First modem path from ``mmcli -L`` (same order as docker entrypoint)."""
+        cp = self._run([self.mmcli_path, '-L'])
+        self._ensure_ok(cp, 'mmcli -L')
+        haystack = (cp.stdout or '') + '\n' + (cp.stderr or '')
+        match = _modem_path_re.search(haystack)
+        if not match:
+            raise MmcliError(
+                'No modem in mmcli -L output',
+                stdout=cp.stdout or '',
+                stderr=cp.stderr or '',
+                exit_code=cp.returncode,
+            )
+        return int(match.group(1))
+
     def ensure_modem_index(self, modem_index: int) -> None:
         present = self.list_modem_indices()
         if modem_index not in present:
@@ -252,6 +267,39 @@ class MMCLIClient:
         fallback = _parse_keyvalue(cp_plain.stdout or '')
         merged_fb = _merge_mmcli_sources(kv_data, js_data, fallback)
         return merged_fb
+
+
+def resolve_modem_mmcli_index(
+    configured: int | None = None,
+    *,
+    client: MMCLIClient | None = None,
+) -> int:
+    """Return a working ``mmcli -m N`` index, falling back when the configured index vanished.
+
+    After SIM unlock or enable, ModemManager often re-enumerates the same hardware as a new
+    index (e.g. ``0`` → ``1``). Callers should use the returned value for mmcli operations.
+    """
+    from django.conf import settings
+
+    mm = client or MMCLIClient()
+    want = int(configured if configured is not None else getattr(settings, 'MODEM_MMCLI_INDEX', 0))
+    present = mm.list_modem_indices()
+    if want in present:
+        return want
+    if not present:
+        raise MmcliError(
+            f'Modem index {want} not found and mmcli -L lists no modems',
+            stderr='no modems',
+            exit_code=-2,
+        )
+    fallback = mm.primary_modem_index()
+    _LOGGER.warning(
+        'MODEM_MMCLI_INDEX=%s not in mmcli -L (present=%s); using primary modem %s',
+        want,
+        present,
+        fallback,
+    )
+    return fallback
 
 
 def _normalize_key(raw: str) -> str:

@@ -49,6 +49,23 @@ def test_ensure_modem_index_raises_when_missing():
             client.ensure_modem_index(0)
 
 
+def test_resolve_modem_mmcli_index_uses_configured_when_present():
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+
+    client = MMCLIClient()
+    with patch.object(MMCLIClient, 'list_modem_indices', return_value=[0, 1]):
+        assert resolve_modem_mmcli_index(1, client=client) == 1
+
+
+def test_resolve_modem_mmcli_index_falls_back_to_primary():
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+
+    client = MMCLIClient()
+    with patch.object(MMCLIClient, 'list_modem_indices', return_value=[1]):
+        with patch.object(MMCLIClient, 'primary_modem_index', return_value=1):
+            assert resolve_modem_mmcli_index(0, client=client) == 1
+
+
 def test_list_sms_paths_parses():
     hay = '/org/freedesktop/ModemManager1/SMS/1 foo\n/org/freedesktop/ModemManager1/SMS/2\n'
     client = MMCLIClient()
