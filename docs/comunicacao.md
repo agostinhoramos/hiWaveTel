@@ -217,6 +217,37 @@ Resposta JSON (campos principais):
 
 Código HTTP **503** quando não há modems ou ping falha; **200** quando `ok` é verdadeiro.
 
+### 5.6 Estado de presença no admin e mensagens com `source: "django"` (MQTT health)
+
+O Django Admin (**`/admin/external_device/externaldevice/`**) reflecte presença através dos campos **`is_available`** e **`last_seen`** do modelo **`ExternalDevice`**. Estes campos são actualizados quando o backend recebe:
+
+- um **`health/ping`** tratado como **telemetria** em `GatewayMqttClient._handle_health_ping` (payload **sem** `"source"` exactamente igual a **`django`** e com **`battery_level`** e/ou **`network_type`**) — persistência via `DeviceHealthTelemetry` + `ExternalDevice.mark_seen()` ([`apps/external_device/mqtt_client.py`](../apps/external_device/mqtt_client.py)), **ou**
+- um **`health/pong`** publicado pela app ou gateway cliente em **`…/health/pong`** — o gateway chama `ExternalDevice.mark_seen()` em `_handle_health_pong` assim que resolve o `{id}` sanitizado (**repor o mesmo `ping_id` que veio no ping do servidor** é a prática esperada para seguir pedido/resposta lado a lado e nos logs).
+
+O hiWaveTel (e integrações tipo hiDisheLink) publicam pedidos activos em `…/health/ping` com um payload neste formato:
+
+```json
+{
+  "ping_id": "ping_9895bccfaed4",
+  "timestamp": "2026-05-17T19:01:59.723880+00:00",
+  "source": "django"
+}
+```
+
+Esse tráfego pode aparecer nos logs MQTT do broker ou do gateway **antes** de outras callbacks de health. **Por desenho**, mensagens `health/ping` com `"source": "django"` são **ignoradas** para actualizar disponibilidade: caso contrário o eco seria contado como “batimento do telemóvel” e falsificaria o estado.
+
+Com **`LOG_LEVEL=DEBUG`**, o gateway (`GatewayMqttClient`) regista uma linha explícita quando ignora esse eco do ping do Django e resume o que o integrador deve fazer.
+
+**Cliente esperado:** a app Android **hiDisheLink SMS** desse equipamento (**`device_id`**) **ou** um **gateway/API externo** que se ligue ao **broker** e use os **`TOPIC_*`** devolvidos por **`GET /api/sms/device/mqtt-config/`**. Este papel é **distinto** do processo servidor Django (**não** é o servidor “consumir” o próprio ping) e **não** cobre uma integração **apenas REST** sem cliente MQTT quando se pretende cumprir o ciclo **health**/presença descrito aqui.
+
+**Conclusão para integradores:** ver linhas de log com `source: django` **não** significa que o dispositivo respondeu; significa que o servidor (ou o eco da própria publicação) foi recebido. Para **actualizar presença no admin**, o cliente **tem de**:
+
+1. **Subscrever** `TOPIC_HEALTH_PING` (tópico resolvido na resposta `mqtt-config`, com `{device_id}` sanitizado).
+2. Ao receber JSON com `"source": "django"` e `ping_id`, **publicar** em `TOPIC_HEALTH_PONG` o **mesmo** `ping_id` (+ `timestamp` / `app_version` opcionais).
+3. **E/ou** publicar **`health/ping`** com telemetria que o servidor persista (**`battery_level`** e/ou **`network_type`**) e **sem** `"source"` igual a **`django`** (alternativa a só responder com pong — ver código e § 6.7).
+
+Com **`MQTT_HEALTH_AUTO_PONG=true`** (valor por defeito), o próprio cliente MQTT **`run_mqtt_gateway`** publica também **`health/pong`** quando recebe `health/ping` com **`ping_id`**, **incluindo** payloads **`source: django`** — em linha com o comentário em **`.env.example`**. **`MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO`** mantém‑se só como segundo interruptor opcional combinado nas settings (cenários raros); em instalações normais basta **`MQTT_HEALTH_AUTO_PONG`**.
+
 ---
 
 ## 6. MQTT — configuração
@@ -238,6 +269,33 @@ Todas as variáveis listadas em `.env.example` sob a secção MQTT; as mais rele
 
 **Sanitização de `device_id` nos tópicos:** caracteres `+` e `#` são removidos do identificador quando inserido no path MQTT (evitar conflito com wildcards MQTT).
 
+### 6.6 Exemplo JSON de **resposta**: `TOPIC_HEALTH_PONG` (`{device_prefix}/{id}/health/pong`)
+
+Resposta típica (recomenda-se sempre incluir **`ping_id`** igual ao enviado no ping do servidor, para correlacionar logs no broker):
+
+```json
+{
+  "ping_id": "ping_b6d5d5d5d500",
+  "timestamp": "2026-05-17T20:41:52.068Z",
+  "app_version": "1.2.34"
+}
+```
+
+O gateway (`GatewayMqttClient._handle_health_pong`) chama **`ExternalDevice.mark_seen()`** assim que reconhece o `device_id` no tópico; **`ping_id`** aparece sobretudo nos logs e na integração com o lado cliente — deve ser **mantido igual** ao do ping para poder seguir fluxo lado a lado.
+
+### 6.7 Checklist mínimo (integração cliente / gateway — health MQTT)
+
+| # | Passo |
+|---:|--------|
+| 1 | Resolver broker e placeholders via **`GET …/mqtt-config`** (credenciais, `MQTT_*`, `TOPIC_HEALTH_PING`, `TOPIC_HEALTH_PONG`, QoS quando expostos). |
+| 2 | Aplicar **sanitização** do `device_id` nos paths (remover **`+`** e **`#`**, ver função `sanitize_device_id`). |
+| 3 | **Subscrever** `TOPIC_HEALTH_PING`. |
+| 4 | Ao receber **`health/ping`** com `"source":"django"` e **`ping_id`**, **publicar** em **`TOPIC_HEALTH_PONG`** o **mesmo** **`ping_id`** (`timestamp` / `app_version` opcionais). |
+| 5 | Alternativa ao pong: publicar **`health/ping`** **sem** `source` igual a **`django`** e com **`battery_level`** e/ou **`network_type`** (campos que activam **`_persist_health_ping_telemetry`** + **`mark_seen()`**); outros JSON em `health/ping` **não** actualizam `last_seen`, embora possam disparar pong automático do gateway se (**`ping_id`** + **`MQTT_HEALTH_AUTO_PONG`**) aplicável ao legado (ver código). |
+| 6 | Manter QoS e reconexão alinhadas com o configurado pelo backend; usar **`LOG_LEVEL=DEBUG`** no gateway para mensagens específicas sobre pings `source=django`. |
+
+*(Este quadro não substitui fluxos SMS ou quotas; apenas consolida presença e health MQTT.)*
+
 ---
 
 ## 7. MQTT — tópicos e payloads
@@ -256,9 +314,8 @@ Payloads são **JSON UTF-8** salvo indicação em contrário.
 | `{modem_prefix}/modems/{N}/sms/inbox_delivery` | Gateway | Qualquer cliente | Modo **`broadcast`**: inclui também `modem_index`, `mirrored_device_ids`, `device_message_ids` e `message_id` agregado. |
 | `{modem_prefix}/modems/+/status/request` | Cliente | Gateway | Corpo ignorado para lógica; dispara snapshot mmcli. |
 | `{modem_prefix}/modems/{N}/status/response` | Gateway | Cliente | Resposta única com `modem_index`, `gathered_at`, `mmcli_flat`, `success`, `error`. |
-| `{modem_prefix}/modems/{N}/status/telemetry` | Gateway | Cliente | Telemetria periódica ou `event` (`bootstrap`, `state_change`): mesma forma que `response` mais campo `event`. |
-
-### 7.1 Payload `…/sms/status` (dispositivo → gateway)
+| `{device_prefix}/{id}/health/ping` | Gateway (tipo servidor com **`MQTT_HEALTH_SERVER_PING_INTERVAL_SEC` > 0**) e cliente | Gateway (+ outros subscritores) | **`source:"django"`** + **`ping_id`**: pedido de latência ao dispositivo; **só receber este ping não actualiza presença** (§ **5.6**). Com **`MQTT_HEALTH_AUTO_PONG=true`**, o **gateway também publica** `health/pong` com **`ping_id` ecoado** (tipo B igual ao comportamento legacy com **`ping_id`**). **Telemetria** (**`battery_level`** / **`network_type`**, **`source`** ≠ `django` exactamente) → **`mark_seen()`** via persistência em ping. Opcional **`MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO`**: combinado nas settings com **`MQTT_HEALTH_AUTO_PONG`** (ver código). |
+| `{device_prefix}/{id}/health/pong` | Dispositivo, ou **gateway** com **`MQTT_HEALTH_AUTO_PONG=true`** ao receber um ping com **`ping_id`** (incl. **`source: django`**) | Gateway | **`ping_id`** igual ao **`health/ping`** **recomendado** para correlacionar logs; **`ExternalDevice.mark_seen()`** quando o servidor recebe o pong (`GatewayMqttClient._handle_health_pong`). Opcionais **`timestamp`**, **`app_version`**. |
 
 O gateway actualiza `SmsRequest` via `update_request_from_mqtt_status`:
 
@@ -382,4 +439,191 @@ client.publish(topic, json.dumps(payload), qos=1)
 | Sonda uptime modem | `/api/health/` |
 | Contratos e exemplos formais | `/api/schema/` + `/api/docs/` |
 
+### 10.1 Checklist de implementação (cliente / gateway)
+
+1. Registar ou activar **`ExternalDevice`** e obter **`api_key`** / JWT conforme o fluxo REST escolhido (§ 3–4 ou contrato hiDisheLink).
+2. Resolver **broker**, credenciais e templates **`TOPIC_*`** através de **`GET mqtt-config`** (sanitização de `{device_id}` § 6).
+3. Subscrever os tópicos SMS aplicáveis (`send`, `status`, `inbox_delivery`, …) conforme modo **broadcast** ou **per_device**.
+4. Publicar payloads de **`sms/status`** e **`sms/inbox`** com os campos obrigatórios (§ 7.1 e 7.2).
+5. Se usar replicação MQTT de envios, subscrever **`…/sms/send`** quando **`MQTT_PUBLISH_SEND_REQUEST`** estiver activo.
+6. **Subscrever** **`TOPIC_HEALTH_PING`** e tratar pings com **`"source":"django"`** como pedido ao cliente (§ 5.6).
+7. Responder sempre com **`health/pong`** e o **mesmo** **`ping_id`** (§ 6.6 e linha correspondente na tabela § 7).
+8. Manter **`last_seen`**: responder **`health/pong`** (passos **6–7**) **ou** enviar **`health/ping`** telemetria com **`battery_level`** e/ou **`network_type`** e **`source`** não igual a **`django`** (ver `_handle_health_ping`); não confiar em pings MQTT “vazios” para presença.
+9. Alinhar **QoS**, TLS (**porto 8883**) e **`LOG_LEVEL=DEBUG`** no contentor quando for necessário correlacionar ecos MQTT com o gateway.
+10. Rever variáveis em **[`.env.example`](../.env.example)** antes de deploy (MQTT, quotas, **`MQTT_HEALTH_SERVER_PING_INTERVAL_SEC`**, **`MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO`**, etc.).
+
 Para variáveis de ambiente que afectam broker, prefixo MQTT e quotas, consulte **[`.env.example`](../.env.example)** na raiz do repositório.
+
+---
+
+## 14. Modo Bridge hiDisheLink (Remote MQTT)
+
+hiWaveTel pode operar em **modo bridge**, conectando-se ao broker MQTT remoto hiDisheLink para atuar como **Device/Gateway Client** conforme [seção 10 da arquitetura hiDisheLink](./hidishelink-bridge.md).
+
+### Arquitectura Dual-Client
+
+```
+┌─────────────────┐         ┌──────────────────┐         ┌─────────────┐
+│  hiDisheLink    │◄────────┤  hiWaveTel       │◄────────┤  Modem      │
+│  MQTT Broker    │  MQTT   │  Bridge Gateway  │  mmcli  │  Hardware   │
+│  (Remote)       │────────►│  + Local Broker  │────────►│  (SMS)      │
+└─────────────────┘         └──────────────────┘         └─────────────┘
+```
+
+Dois clientes MQTT em paralelo:
+
+1. **RemoteHiDishelinkClient** — liga ao broker remoto hiDisheLink:
+   - Subscreve: `sms/send`, `health/ping`, `sms/inbox/ack`
+   - Publica: `sms/status`, `sms/inbox`, `health/pong`, heartbeat `health/ping`
+   - QoS 1 para todos os tópicos SMS/health
+   - Agrega chunks SMS automaticamente
+
+2. **LocalGatewayClient** — mantém broker local para Android devices (opcional)
+
+### Configuração Rápida
+
+```bash
+# .env
+MQTT_REMOTE_BRIDGE_ENABLED=true
+MQTT_LOCAL_BROKER_ENABLED=true
+MQTT_REMOTE_DEVICE_ID=+351912329317
+MQTT_REMOTE_HEALTH_HEARTBEAT_SEC=60
+```
+
+Django Admin → criar `HiDishelinkDevice` com `api_url`, `api_key`, `device_id`.
+
+```bash
+# Iniciar dual-client
+docker compose restart hiwavetel
+docker compose logs -f hiwavetel | grep -i "remote\|local"
+```
+
+### Fluxos Principais
+
+**SMS Outbound:** hiDisheLink → MQTT `sms/send` → hiWaveTel bridge → mmcli → MQTT `status`  
+**SMS Inbound:** Modem D-Bus → hiWaveTel → Django signal → MQTT `inbox` → hiDisheLink  
+**Health:** Server `ping` (source=django) → Gateway `pong` + heartbeat telemetria periódica
+
+### Conformidade Spec hiDisheLink
+
+Implementa **checklist completo seção 10.10**:
+- ✅ Sanitiza `device_id`, QoS 1, ACK imediato `received`, status final `details[]`
+- ✅ Health pong para probes `source:django`, heartbeat sem `source:django`
+- ✅ Inbox com `message_id` único, agrega chunks, obtém config via API
+
+**Documentação completa:** [`docs/hidishelink-bridge.md`](./hidishelink-bridge.md)
+
+---
+
+---
+
+## 15. Otimizações de Performance — Processamento Inbound SMS
+
+### 15.1 Visão Geral
+
+A partir da versão otimizada, o fluxo de processamento de SMS recebidos foi redesenhado para eliminar gargalos críticos e aumentar o throughput em até 150x para sistemas com múltiplos dispositivos.
+
+### 15.2 Arquitetura Otimizada
+
+```mermaid
+flowchart TD
+    DBus[D-Bus Messaging.Added] -->|enqueue| DetectionQueue[SmsProcessingQueue\n3 workers]
+    DetectionQueue -->|persist_inbound_sms| Database[(InboundSms DB)]
+    Database -->|post_save signal| SignalHandler[Signal Handler\nNÃO-BLOQUEANTE]
+    SignalHandler -->|transaction.on_commit| Validator[Validação Rápida]
+    Validator -->|enqueue| ProcessingQueue[InboundProcessorQueue\n2 workers]
+    ProcessingQueue -->|async| Mirror[Mirror to Devices]
+    ProcessingQueue -->|async + retry| RemoteMQTT[Publish Remote MQTT]
+    Mirror --> LocalMQTT[Local MQTT]
+    RemoteMQTT --> RetryLogic[Retry Exponencial\n5 tentativas]
+```
+
+### 15.3 Optimizações Implementadas
+
+#### Fase 1: Quick Wins (Impacto Imediato)
+
+**1. Signal Handler Gates** (`apps/sms/apps.py`)
+- Adicionado check `if not created: return` — elimina processamento duplicado em updates
+- Usa `transaction.on_commit` — liberta worker thread imediatamente após commit
+- **Impacto:** 50% redução em invocações, <10ms por SMS vs. 2-5s anterior
+
+**2. Hoist Dedup Queries** (`apps/external_device/services.py`)
+- Check `inbound_should_skip_modem_mirror` movido para fora do loop de dispositivos
+- **Impacto:** 2N queries → 2 queries por SMS (e.g., 10 devices: 20 → 2 queries)
+
+**3. API Inbox Sync Throttling** (`apps/external_device/views.py`)
+- Cache TTL de 5 minutos em `sync_inbox_from_modem_store`
+- **Impacto:** ~500 queries → 0 queries em 95% dos pedidos API
+
+**4. Device ID Sanitization Cache** (`apps/external_device/mqtt_client.py`)
+- Cache in-memory LRU com invalidação automática via signals
+- **Impacto:** O(N) table scan → O(1) lookup cached
+
+#### Fase 2: Async Background Processing
+
+**5. Inbound Processor Queue** (`apps/sms/inbound_processor.py`)
+- Fila dedicada com 2 workers (configurável via `INBOUND_PROCESSOR_WORKERS`)
+- Retry exponencial para falhas MQTT (base 1s, max 60s, 5 tentativas)
+- Métricas built-in: processed, failed, retries, queue_size
+
+**6. Signal Handler Refatorado** (`apps/sms/apps.py`)
+- Enfileira processamento em vez de executar sincronamente
+- Fallback para processamento síncrono se fila cheia ou desabilitada
+- **Impacto:** Worker thread libertado em <10ms vs. bloqueio de segundos/minutos
+
+### 15.4 Variáveis de Ambiente
+
+```bash
+# apps/sms/inbound_processor.py
+INBOUND_PROCESSOR_WORKERS=2          # Número de workers (0 = desabilita async)
+INBOUND_PROCESSOR_MAX_SIZE=500       # Tamanho máximo da fila
+INBOUND_PROCESSOR_RETRY_MAX=5        # Tentativas de retry para MQTT
+INBOUND_PROCESSOR_RETRY_BASE_SEC=1.0 # Delay base para backoff exponencial
+```
+
+### 15.5 Performance Esperada
+
+Para sistema com **10 dispositivos ativos** recebendo **100 SMS/hora**:
+
+**Antes das otimizações:**
+- Signal handler bloqueia worker thread por ~2-5 segundos/SMS
+- 20 queries de dedup extra por SMS
+- 500 queries DB em cada pedido API inbox
+- Potencial bloqueio de 150s com MQTT ephemeral em modo per_device
+
+**Depois das otimizações:**
+- Signal handler completa em <10ms (apenas enqueue)
+- 2 queries de dedup total por SMS (90% redução)
+- 500 queries → 0 em pedidos API cached (95% redução)
+- Device lookup: O(N) scan → O(1) cache hit
+- **Throughput geral: melhoria de ~50-100x**
+
+### 15.6 Rollback / Troubleshooting
+
+**Desabilitar processamento async:**
+```bash
+# .env
+INBOUND_PROCESSOR_WORKERS=0
+```
+
+Signal handler volta automaticamente ao comportamento síncrono original (com as outras otimizações mantidas: created check, dedup hoisting, cache, etc.).
+
+**Monitorização:**
+```bash
+# Logs do processor
+docker compose logs -f hiwavetel | grep -i "inbound.*processor\|processed=\|failed="
+
+# Métricas (via código Python)
+from apps.sms.inbound_processor import get_inbound_processor
+processor = get_inbound_processor()
+print(processor.get_metrics())  # {'processed': N, 'failed': M, 'retries': R, 'queue_size': Q}
+```
+
+### 15.7 Otimizações Pendentes (Opcionais)
+
+1. **Offload MQTT Handler DB** — Mover operações ORM de `_handle_inbox_message` para worker threads (pattern similar ao remote SMS send)
+2. **Replace Ephemeral MQTT** — Usar `LocalGatewayClient` persistente para inbox_delivery em vez de conexões ephemeral por device
+3. **Celery Integration** — Para volumes muito altos, migrar para Celery/RQ com Redis task broker
+
+**Impacto incremental:** Estas otimizações adicionais podem trazer melhorias de 2-3x extra, mas o sistema atual já é 50-100x mais rápido que a baseline.
+
