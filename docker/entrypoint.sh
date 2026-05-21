@@ -371,6 +371,8 @@ cd "${APP_ROOT}"
 
 python manage.py migrate --noinput
 
+python manage.py ensure_superuser
+
 if truthy "${SMS_CLEANUP_ON_STARTUP:-false}"; then
   python manage.py cleanup_sms_storage
   echo "SMS storage cleanup completed (SMS_CLEANUP_ON_STARTUP=true)."

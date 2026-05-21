@@ -150,3 +150,102 @@ def test_run_mqtt_gateway_keyboard_interrupt(mock_client_class, capsys):
     
     out = capsys.readouterr().out.lower()
     assert 'shutting down' in out
+
+
+@pytest.mark.django_db
+def test_ensure_superuser_creates_from_env(monkeypatch):
+    """First run creates superuser from DJANGO_SUPERUSER_* env vars."""
+    from django.contrib.auth import get_user_model
+
+    monkeypatch.setenv('DJANGO_SUPERUSER_USERNAME', 'bootstrap_admin')
+    monkeypatch.setenv('DJANGO_SUPERUSER_EMAIL', 'bootstrap@test.invalid')
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', 'bootstrap-pw-123')
+
+    User = get_user_model()
+    assert not User.objects.filter(username='bootstrap_admin').exists()
+
+    call_command('ensure_superuser')
+
+    user = User.objects.get(username='bootstrap_admin')
+    assert user.is_superuser
+    assert user.is_staff
+    assert user.is_active
+    assert user.email == 'bootstrap@test.invalid'
+    assert user.check_password('bootstrap-pw-123')
+
+
+@pytest.mark.django_db
+def test_ensure_superuser_idempotent(monkeypatch):
+    """Second run does not duplicate user or change password."""
+    from django.contrib.auth import get_user_model
+
+    monkeypatch.setenv('DJANGO_SUPERUSER_USERNAME', 'bootstrap_dup')
+    monkeypatch.setenv('DJANGO_SUPERUSER_EMAIL', 'dup@test.invalid')
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', 'first-password')
+
+    User = get_user_model()
+    call_command('ensure_superuser')
+    assert User.objects.filter(username='bootstrap_dup').count() == 1
+
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', 'second-password-should-not-apply')
+    call_command('ensure_superuser')
+
+    assert User.objects.filter(username='bootstrap_dup').count() == 1
+    user = User.objects.get(username='bootstrap_dup')
+    assert user.check_password('first-password')
+    assert not user.check_password('second-password-should-not-apply')
+
+
+@pytest.mark.django_db
+def test_ensure_superuser_repairs_existing_user_flags(monkeypatch):
+    """Existing non-superuser gets staff/superuser flags without password reset."""
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    User.objects.create_user(
+        username='repair_me',
+        email='old@test.invalid',
+        password='keep-this-password',
+        is_superuser=False,
+        is_staff=False,
+        is_active=True,
+    )
+
+    monkeypatch.setenv('DJANGO_SUPERUSER_USERNAME', 'repair_me')
+    monkeypatch.setenv('DJANGO_SUPERUSER_EMAIL', 'new@test.invalid')
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', 'ignored-new-password')
+
+    call_command('ensure_superuser')
+
+    user = User.objects.get(username='repair_me')
+    assert user.is_superuser
+    assert user.is_staff
+    assert user.is_active
+    assert user.email == 'new@test.invalid'
+    assert user.check_password('keep-this-password')
+
+
+@pytest.mark.django_db
+def test_ensure_superuser_skips_when_username_missing(monkeypatch, capsys):
+    monkeypatch.delenv('DJANGO_SUPERUSER_USERNAME', raising=False)
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', 'pw')
+
+    call_command('ensure_superuser')
+
+    out = capsys.readouterr().out.lower()
+    assert 'skipping' in out
+
+
+@pytest.mark.django_db
+def test_ensure_superuser_strips_quotes_from_password(monkeypatch):
+    """Password values wrapped in quotes (common in .env) are stripped."""
+    from django.contrib.auth import get_user_model
+
+    monkeypatch.setenv('DJANGO_SUPERUSER_USERNAME', 'quoted_pw_user')
+    monkeypatch.setenv('DJANGO_SUPERUSER_EMAIL', 'quoted@test.invalid')
+    monkeypatch.setenv('DJANGO_SUPERUSER_PASSWORD', "'quoted-password'")
+
+    call_command('ensure_superuser')
+
+    user = get_user_model().objects.get(username='quoted_pw_user')
+    assert user.check_password('quoted-password')
