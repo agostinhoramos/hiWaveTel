@@ -2,7 +2,8 @@
 #
 # Host network (`network_mode: host`) lets ModemManager see `wwan0` / QMI net devices in the same
 # namespace — avoids failures such as “Failed to find a net port in the QMI modem” on Docker bridge.
-# With host network, `ports:` mapping is ignored; Gunicorn binds directly on HIWAVE_PORT on the host.
+# With host network, `ports:` cannot be used (Compose ignores it). Gunicorn binds on the host at
+# HIWAVE_PORT from ../.env (see docker/.env.example). Example LAN URL: http://192.168.1.65:5202/
 #
 # Read-only sysfs USB (`/sys/bus/usb`) aids ModemManager/udev enumeration and debugging; safe as `:ro`.
 # Remove that volume entry if your policy forbids sysfs visibility.
@@ -30,7 +31,7 @@ services:
       DJANGO_LOG_DIR: "${DJANGO_LOG_DIR:-/app/logs}"
       DJANGO_LOG_FILE: "${DJANGO_LOG_FILE:-hiwavetel-api.log}"
       APPLICATION_LOG_LEVEL: "${APPLICATION_LOG_LEVEL:-INFO}"
-      HIWAVE_PORT: "${HIWAVE_PORT:-8000}"
+      # HIWAVE_PORT: omit here — comes from env_file ../.env only (Compose ${VAR} does not read env_file).
       # Bind-mount project root as /app/host so db.sqlite3 can be created automatically (file bind-mounts fail when missing).
       SQLITE_DB_PATH: "${SQLITE_DB_PATH:-/app/host/db.sqlite3}"
       # SQLite concurrency: busy timeout + WAL + inbound persist retries (SMS queue + HTTP).
@@ -79,7 +80,10 @@ services:
       - "${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}:${MODEM_QMI_DEVICE:-/dev/cdc-wdm0}"
     healthcheck:
       test:
-        ["CMD-SHELL", "curl -sf http://127.0.0.1:${HIWAVE_PORT:-8000}/api/health/ >/dev/null || exit 1"]
+        [
+          "CMD-SHELL",
+          "curl -sf http://127.0.0.1:$${HIWAVE_PORT:-8000}/api/health/ >/dev/null || exit 1",
+        ]
       interval: 35s
       timeout: 10s
       retries: 3
