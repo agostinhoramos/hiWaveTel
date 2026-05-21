@@ -1,0 +1,14 @@
+# hiWaveTel SMS storage rotation — systemd timer (hourly)
+#
+# See hiwavetel-cleanup.service for installation instructions.
+
+[Unit]
+Description=Run hiWaveTel SMS storage rotation hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=hiwavetel-cleanup.service
+
+[Install]
+WantedBy=timers.target

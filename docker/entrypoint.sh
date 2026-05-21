@@ -371,6 +371,11 @@ cd "${APP_ROOT}"
 
 python manage.py migrate --noinput
 
+if truthy "${SMS_CLEANUP_ON_STARTUP:-false}"; then
+  python manage.py cleanup_sms_storage
+  echo "SMS storage cleanup completed (SMS_CLEANUP_ON_STARTUP=true)."
+fi
+
 # Modem index for Django / mmcli -m $N when auto-detect matches first enumerated modem path.
 DETECT_MMCLI_INDEX=""
 if [[ "${FOUND}" == "1" && -n "${MODEM_DBUS:-}" ]]; then

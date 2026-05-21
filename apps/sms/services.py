@@ -217,3 +217,88 @@ def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None
         outbound.save(update_fields=('state', 'error_message'))
         _LOGGER.warning('Outbound id=%s failed: %s', outbound.pk, exc)
         return outbound
+
+
+def _delete_oldest_modem_rows(
+    model,
+    *,
+    modem_index: int,
+    limit: int,
+    batch_size: int,
+    dry_run: bool,
+) -> int:
+    """Delete oldest rows for ``model`` at ``modem_index`` when count exceeds ``limit``."""
+    qs = model.objects.filter(modem_index=modem_index)
+    count = qs.count()
+    excess = max(0, count - limit)
+    if excess <= 0:
+        return 0
+
+    deleted = 0
+    remaining = excess
+    while remaining > 0:
+        chunk = min(batch_size, remaining)
+        ids = list(qs.order_by('created_at', 'pk').values_list('pk', flat=True)[:chunk])
+        if not ids:
+            break
+        if dry_run:
+            deleted += len(ids)
+        else:
+            model.objects.filter(pk__in=ids).delete()
+            deleted += len(ids)
+        remaining -= len(ids)
+    return deleted
+
+
+def rotate_modem_sms_storage(
+    modem_index: int,
+    *,
+    limit: int,
+    batch_size: int = 100,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Trim modem-layer SMS rows; ``limit`` is split evenly between inbound and outbound."""
+    per_type_limit = max(1, limit // 2)
+
+    inbound_before = InboundSms.objects.filter(modem_index=modem_index).count()
+    outbound_before = OutboundSms.objects.filter(modem_index=modem_index).count()
+
+    inbound_deleted = _delete_oldest_modem_rows(
+        InboundSms,
+        modem_index=modem_index,
+        limit=per_type_limit,
+        batch_size=batch_size,
+        dry_run=dry_run,
+    )
+    outbound_deleted = _delete_oldest_modem_rows(
+        OutboundSms,
+        modem_index=modem_index,
+        limit=per_type_limit,
+        batch_size=batch_size,
+        dry_run=dry_run,
+    )
+
+    if inbound_deleted or outbound_deleted:
+        _LOGGER.info(
+            'Modem SMS rotation modem_index=%s inbound_deleted=%s outbound_deleted=%s dry_run=%s',
+            modem_index,
+            inbound_deleted,
+            outbound_deleted,
+            dry_run,
+        )
+
+    return {
+        'inbound_deleted': inbound_deleted,
+        'outbound_deleted': outbound_deleted,
+        'inbound_count_before': inbound_before,
+        'outbound_count_before': outbound_before,
+        'per_type_limit': per_type_limit,
+    }
+
+
+def modem_sms_storage_counts(modem_index: int) -> dict[str, int]:
+    """Current modem SMS counts for admin monitoring."""
+    return {
+        'inbound_sms': InboundSms.objects.filter(modem_index=modem_index).count(),
+        'outbound_sms': OutboundSms.objects.filter(modem_index=modem_index).count(),
+    }

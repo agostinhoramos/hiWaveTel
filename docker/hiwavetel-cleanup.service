@@ -1,0 +1,26 @@
+# hiWaveTel SMS storage rotation — systemd service
+#
+# Install (from repo root, adjust WorkingDirectory and paths):
+#   sudo cp docker/hiwavetel-cleanup.service /etc/systemd/system/
+#   sudo cp docker/hiwavetel-cleanup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable hiwavetel-cleanup.timer
+#   sudo systemctl start hiwavetel-cleanup.timer
+#
+# Check status:
+#   systemctl status hiwavetel-cleanup.timer
+#   journalctl -u hiwavetel-cleanup.service -n 50
+
+[Unit]
+Description=hiWaveTel SMS storage rotation cleanup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/webmaster/hiWaveTel
+ExecStart=/home/webmaster/hiWaveTel/docker/cleanup_sms_cron.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -787,6 +787,92 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
     )
 
 
+def _delete_oldest_queryset_rows(
+    queryset,
+    *,
+    excess: int,
+    batch_size: int,
+    dry_run: bool,
+) -> int:
+    """Delete up to ``excess`` rows from ``queryset`` (oldest first), in batches."""
+    if excess <= 0:
+        return 0
+    deleted = 0
+    remaining = excess
+    while remaining > 0:
+        chunk = min(batch_size, remaining)
+        ids = list(queryset.values_list('pk', flat=True)[:chunk])
+        if not ids:
+            break
+        if dry_run:
+            deleted += len(ids)
+        else:
+            _n, _ = queryset.model.objects.filter(pk__in=ids).delete()
+            deleted += len(ids)
+        remaining -= len(ids)
+    return deleted
+
+
+def rotate_gateway_sms_storage(
+    device: ExternalDevice,
+    *,
+    inbox_limit: int,
+    request_limit: int,
+    batch_size: int = 100,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Trim gateway SMS rows for ``device``; delete oldest inbox/requests when over limit."""
+    inbox_qs = InboxMessage.objects.filter(device=device)
+    request_qs = SmsRequest.objects.filter(device=device)
+
+    inbox_count = inbox_qs.count()
+    request_count = request_qs.count()
+    inbox_excess = max(0, inbox_count - inbox_limit)
+    request_excess = max(0, request_count - request_limit)
+
+    inbox_deleted = 0
+    if inbox_excess:
+        inbox_deleted = _delete_oldest_queryset_rows(
+            inbox_qs.order_by('received_at', 'pk'),
+            excess=inbox_excess,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+
+    request_deleted = 0
+    if request_excess:
+        request_deleted = _delete_oldest_queryset_rows(
+            request_qs.order_by('created_at', 'pk'),
+            excess=request_excess,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+
+    if inbox_deleted or request_deleted:
+        _LOGGER.info(
+            'Gateway SMS rotation device_id=%s inbox_deleted=%s requests_deleted=%s dry_run=%s',
+            device.device_id,
+            inbox_deleted,
+            request_deleted,
+            dry_run,
+        )
+
+    return {
+        'inbox_deleted': inbox_deleted,
+        'requests_deleted': request_deleted,
+        'inbox_count_before': inbox_count,
+        'requests_count_before': request_count,
+    }
+
+
+def gateway_sms_storage_status(device: ExternalDevice) -> dict[str, int]:
+    """Current gateway SMS counts for admin monitoring."""
+    return {
+        'inbox_messages': InboxMessage.objects.filter(device=device).count(),
+        'sms_requests': SmsRequest.objects.filter(device=device).count(),
+    }
+
+
 def external_device_delete_preview(device: ExternalDevice) -> dict[str, int]:
     """Counts of rows removed by :func:`delete_external_device_and_dependencies` (read-only)."""
     pk = device.device_id

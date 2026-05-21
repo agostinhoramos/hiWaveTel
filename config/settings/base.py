@@ -280,6 +280,19 @@ if MQTT_REMOTE_HEALTH_HEARTBEAT_SEC <= 0:
 # Gateway startup: fetch mqtt-config from remote API or use cached snapshot
 MQTT_CONFIG_STARTUP_REFRESH = truthy_env('MQTT_CONFIG_STARTUP_REFRESH', default=False)
 
+# SMS storage rotation (apps/external_device/management/commands/cleanup_sms_storage.py)
+SMS_STORAGE_ROTATION_ENABLED = truthy_env('SMS_STORAGE_ROTATION_ENABLED', default=True)
+SMS_MAX_MESSAGES_PER_DEVICE = positive_int_env('SMS_MAX_MESSAGES_PER_DEVICE', 1000)
+if SMS_MAX_MESSAGES_PER_DEVICE <= 0:
+    SMS_MAX_MESSAGES_PER_DEVICE = 1000
+SMS_MAX_MESSAGES_PER_MODEM = positive_int_env('SMS_MAX_MESSAGES_PER_MODEM', 2000)
+if SMS_MAX_MESSAGES_PER_MODEM <= 0:
+    SMS_MAX_MESSAGES_PER_MODEM = 2000
+SMS_ROTATION_BATCH_SIZE = positive_int_env('SMS_ROTATION_BATCH_SIZE', 100)
+if SMS_ROTATION_BATCH_SIZE <= 0:
+    SMS_ROTATION_BATCH_SIZE = 100
+SMS_CLEANUP_ON_STARTUP = truthy_env('SMS_CLEANUP_ON_STARTUP', default=False)
+
 # Inbound SMS post-save processor queue (apps/sms/inbound_processor.py)
 # Async processing of InboundSms mirror + MQTT publish with retry logic
 INBOUND_PROCESSOR_WORKERS = positive_int_env('INBOUND_PROCESSOR_WORKERS', 2)

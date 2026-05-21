@@ -8,6 +8,7 @@ import uuid
 from datetime import timedelta
 
 from django import forms
+from django.conf import settings
 from django.contrib import admin
 from django.contrib import messages
 from django.http import HttpResponseRedirect
@@ -33,6 +34,7 @@ from .mqtt_client import ephemeral_connection_from_flat, publish_json_ephemeral,
 from .services import (
     delete_external_device_and_dependencies,
     external_device_delete_preview,
+    gateway_sms_storage_status,
     generate_token,
     hash_token,
     process_sms_request,
@@ -126,7 +128,16 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
     change_form_template = 'admin/externaldevice_change_form.html'
     delete_confirmation_template = 'admin/externaldevice_delete_confirmation.html'
 
-    list_display = ['device_id', 'name', 'device_type', 'status', 'is_available', 'last_seen', 'created_at']
+    list_display = [
+        'device_id',
+        'name',
+        'device_type',
+        'status',
+        'sms_storage_summary',
+        'is_available',
+        'last_seen',
+        'created_at',
+    ]
     list_filter = ['status', 'device_type', 'is_available']
     search_fields = ['device_id', 'name', 'mqtt_client_id']
     readonly_fields = [
@@ -138,6 +149,7 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
         'created_at',
         'updated_at',
         'device_inbox_preview',
+        'sms_storage_detail',
     ]
     fieldsets = (
         ('Device Info', {
@@ -161,7 +173,7 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
             'Duplicate mmcli mirrors across devices are avoided by setting `"modem_inbox_mirror": false` in metadata on secondary devices.',
         }),
         ('Limits', {
-            'fields': ('max_recipients_per_request', 'daily_sms_limit'),
+            'fields': ('max_recipients_per_request', 'daily_sms_limit', 'sms_storage_detail'),
         }),
         ('Timestamps', {
             'fields': ('created_at', 'updated_at'),
@@ -170,6 +182,7 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
     actions = [
         'generate_registration_token',
         'sync_inbox_from_modem',
+        'check_sms_storage_status',
         'delete_device_and_dependencies',
         'delete_selected_devices_and_dependencies',
     ]
@@ -228,6 +241,74 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
         )
 
     sync_inbox_from_modem.short_description = 'Sync inbox from modem (select one device)'  # type: ignore[attr-defined]
+
+    def _device_sms_limit(self) -> int:
+        return getattr(settings, 'SMS_MAX_MESSAGES_PER_DEVICE', 1000)
+
+    def sms_storage_summary(self, obj: ExternalDevice) -> str:
+        """Compact inbox + request counts for changelist."""
+        stats = gateway_sms_storage_status(obj)
+        total = stats['inbox_messages'] + stats['sms_requests']
+        limit = self._device_sms_limit() * 2
+        pct = int((total / limit) * 100) if limit else 0
+        if pct >= 100:
+            style = 'color:#ba2121;font-weight:bold;'
+        elif pct >= 80:
+            style = 'color:#996800;font-weight:bold;'
+        else:
+            style = ''
+        return format_html(
+            '<span style="{}">inbox {} / req {} ({}%)</span>',
+            style,
+            stats['inbox_messages'],
+            stats['sms_requests'],
+            pct,
+        )
+
+    sms_storage_summary.short_description = 'SMS storage'  # type: ignore[attr-defined]
+
+    def sms_storage_detail(self, obj: ExternalDevice | None) -> str:
+        """Detailed storage counts vs configured limits."""
+        if obj is None or not obj.pk:
+            return format_html('<p>Save the device first to see SMS storage status.</p>')
+        stats = gateway_sms_storage_status(obj)
+        limit = self._device_sms_limit()
+        inbox_pct = int((stats['inbox_messages'] / limit) * 100) if limit else 0
+        req_pct = int((stats['sms_requests'] / limit) * 100) if limit else 0
+        return format_html(
+            '<p>InboxMessage: <strong>{}</strong> / {} ({}%)</p>'
+            '<p>SmsRequest: <strong>{}</strong> / {} ({}%)</p>'
+            '<p>Rotation limit per type: <code>SMS_MAX_MESSAGES_PER_DEVICE={}</code></p>',
+            stats['inbox_messages'],
+            limit,
+            inbox_pct,
+            stats['sms_requests'],
+            limit,
+            req_pct,
+            limit,
+        )
+
+    sms_storage_detail.short_description = 'SMS storage status'  # type: ignore[attr-defined]
+
+    def check_sms_storage_status(self, request, queryset):  # type: ignore[override]
+        """Show SMS storage counts for selected devices (no deletion)."""
+        limit = self._device_sms_limit()
+        for device in queryset:
+            stats = gateway_sms_storage_status(device)
+            self.message_user(
+                request,
+                format_html(
+                    '<strong>{}</strong>: inbox {}/{}, requests {}/{}',
+                    device.device_id,
+                    stats['inbox_messages'],
+                    limit,
+                    stats['sms_requests'],
+                    limit,
+                ),
+                level=messages.INFO,
+            )
+
+    check_sms_storage_status.short_description = 'Check SMS storage status'  # type: ignore[attr-defined]
 
     def delete_device_and_dependencies(self, request, queryset):  # type: ignore[override]
         """Redirect to admin delete confirmation for the selected device."""
