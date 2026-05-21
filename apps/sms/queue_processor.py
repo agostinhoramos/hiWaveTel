@@ -77,9 +77,13 @@ class SmsProcessingQueue:
             self.queue.put((sms_path, modem_index), block=False)
             _LOGGER.debug('Enqueued SMS: path=%s modem=%s queue_size=%s', 
                          sms_path, modem_index, self.queue.qsize())
+            from .metrics import get_metrics_collector
+            get_metrics_collector().increment('enqueue_success')
             return True
         except queue.Full:
             _LOGGER.error('SMS queue is full! Dropping message: %s', sms_path)
+            from .metrics import get_metrics_collector
+            get_metrics_collector().increment('enqueue_failed_queue_full')
             return False
     
     def _worker_loop(self) -> None:
@@ -132,6 +136,8 @@ class SmsProcessingQueue:
             elapsed = time.time() - start_time
             _LOGGER.exception('%s failed after %.3fs: path=%s error=%s', 
                             worker_name, elapsed, sms_path, exc)
+            from .dead_letter_queue import enqueue_persist_failure
+            enqueue_persist_failure(sms_path, modem_index, str(exc))
 
 
 # Global singleton instance

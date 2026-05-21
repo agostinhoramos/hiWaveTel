@@ -293,6 +293,25 @@ if SMS_ROTATION_BATCH_SIZE <= 0:
     SMS_ROTATION_BATCH_SIZE = 100
 SMS_CLEANUP_ON_STARTUP = truthy_env('SMS_CLEANUP_ON_STARTUP', default=False)
 
+# SMS reliability & recovery (apps/sms/dbus_watch.py, dead_letter_queue.py)
+MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC = positive_int_env('MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 300)
+SMS_DLQ_ENABLED = truthy_env('SMS_DLQ_ENABLED', default=True)
+SMS_DLQ_DB_PATH = os.environ.get('SMS_DLQ_DB_PATH', str(BASE_DIR / 'dlq_sms.db'))
+SMS_DLQ_MAX_SIZE = positive_int_env('SMS_DLQ_MAX_SIZE', 1000)
+SMS_DLQ_RETRY_INTERVAL_SEC = positive_int_env('SMS_DLQ_RETRY_INTERVAL_SEC', 60)
+SMS_DLQ_MAX_RETRIES = positive_int_env('SMS_DLQ_MAX_RETRIES', 10)
+SMS_DEBUG_LOGGING = truthy_env('SMS_DEBUG_LOGGING', default=False)
+
+# Inbound SMS whitelist: only accept SMS from these numbers (comma-separated, no whitespace)
+# Empty string = whitelist disabled (accept all)
+_whitelist_raw = os.environ.get('SMS_INBOUND_WHITELIST', '').strip()
+SMS_INBOUND_WHITELIST = [n.strip() for n in _whitelist_raw.split(',') if n.strip()] if _whitelist_raw else []
+
+# Extended mmcli polling while ModemManager reports state=receiving (apps/sms/services.py)
+MMCLI_RECEIVING_MAX_WAIT_SEC = positive_int_env('MMCLI_RECEIVING_MAX_WAIT_SEC', 60)
+if MMCLI_RECEIVING_MAX_WAIT_SEC <= 0:
+    MMCLI_RECEIVING_MAX_WAIT_SEC = 60
+
 # Inbound SMS post-save processor queue (apps/sms/inbound_processor.py)
 # Async processing of InboundSms mirror + MQTT publish with retry logic
 INBOUND_PROCESSOR_WORKERS = positive_int_env('INBOUND_PROCESSOR_WORKERS', 2)

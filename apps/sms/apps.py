@@ -37,7 +37,7 @@ class SmsConfig(AppConfig):
                 update_fields = kwargs.get('update_fields')
                 if update_fields is not None:
                     patched = set(update_fields)
-                    if not (patched & {'text', 'from_number'}):
+                    if not (patched & {'text', 'from_number', 'mm_state'}):
                         return
                 # update_fields=None → full save; proceed if content is ready.
 

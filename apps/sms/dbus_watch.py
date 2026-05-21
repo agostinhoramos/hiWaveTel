@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import os
@@ -13,8 +14,11 @@ from dbus_next.aio import MessageBus
 from dbus_next.errors import DBusError, InterfaceNotFoundError
 import dbus_next.message_bus as _dbus_mb
 
+from django.conf import settings
 from django.db import DatabaseError, IntegrityError
 
+from .dead_letter_queue import enqueue_persist_failure
+from .metrics import get_metrics_collector
 from .mmcli_client import MMCLIClient, MmcliError, resolve_modem_mmcli_index
 from .modem_ready import try_enable_modem as _try_enable_modem
 from .queue_processor import get_sms_queue
@@ -92,6 +96,34 @@ def sync_modem_sms_snapshot(modem_index: int, client: MMCLIClient | None = None)
     return n
 
 
+async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
+    """Background periodic mmcli snapshot to recover SMS missed during D-Bus gaps."""
+    if interval_sec <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    metrics = get_metrics_collector()
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            count = await loop.run_in_executor(None, sync_modem_sms_snapshot, modem_index)
+            from .services import refresh_stale_inbound_sms_rows
+
+            stale_stats = await loop.run_in_executor(
+                None,
+                refresh_stale_inbound_sms_rows,
+                modem_index,
+            )
+            metrics.increment('periodic_recovery_runs')
+            _LOGGER.info(
+                'Periodic recovery: synced %s SMS paths, stale refresh %s (modem_index=%s)',
+                count,
+                stale_stats,
+                modem_index,
+            )
+        except Exception as exc:
+            _LOGGER.exception('Periodic recovery failed modem_index=%s: %s', modem_index, exc)
+
+
 async def _persist_async(mm_path: str, modem_index: int) -> None:
     loop = asyncio.get_running_loop()
 
@@ -99,6 +131,15 @@ async def _persist_async(mm_path: str, modem_index: int) -> None:
         persist_inbound_sms(mm_path, modem_index, None)
 
     await loop.run_in_executor(None, _persist)
+
+
+def _persist_or_dlq(sms_path: str, modem_index: int) -> None:
+    """Synchronous persist with DLQ fallback on failure."""
+    try:
+        persist_inbound_sms(sms_path, modem_index, None)
+    except Exception as exc:
+        _LOGGER.exception('Fallback persist failed for %s: %s', sms_path, exc)
+        enqueue_persist_failure(sms_path, modem_index, str(exc))
 
 
 def _make_on_added_callback(modem_index: int):
@@ -112,6 +153,8 @@ def _make_on_added_callback(modem_index: int):
     """
     def _on_added(sms_path: str, received: bool = False) -> None:
         """Synchronous callback for D-Bus Messaging.Added signal."""
+        metrics = get_metrics_collector()
+        metrics.increment('dbus_signals_received')
         _LOGGER.info(
             'D-Bus Messaging.Added: sms_path=%s received=%s modem_index=%s',
             sms_path, received, modem_index,
@@ -125,13 +168,10 @@ def _make_on_added_callback(modem_index: int):
                 _LOGGER.info('SMS enqueued: sms_path=%s modem_index=%s', sms_path, modem_index)
             else:
                 _LOGGER.error('Failed to enqueue SMS (queue full): %s', sms_path)
-                # Fallback: persist synchronously as last resort
-                try:
-                    persist_inbound_sms(sms_path, modem_index, None)
-                except Exception as fallback_exc:
-                    _LOGGER.exception('Fallback persist also failed for %s: %s', sms_path, fallback_exc)
+                _persist_or_dlq(sms_path, modem_index)
         except Exception as exc:
             _LOGGER.exception('Failed to enqueue SMS %s: %s', sms_path, exc)
+            _persist_or_dlq(sms_path, modem_index)
 
     return _on_added
 
@@ -191,6 +231,19 @@ async def run_modem_added_listener(
             messaging.on_added(_make_on_added_callback(modem_index))
             _LOGGER.info('Listening on %s Messaging.Added (system bus)', path)
 
+            recovery_task: asyncio.Task | None = None
+            recovery_interval = int(getattr(settings, 'MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 300))
+            if recovery_interval > 0:
+                recovery_task = asyncio.create_task(
+                    _periodic_recovery_loop(modem_index, recovery_interval),
+                    name=f'sms-periodic-recovery-{modem_index}',
+                )
+                _LOGGER.info(
+                    'Periodic SMS recovery enabled modem_index=%s interval_sec=%s',
+                    modem_index,
+                    recovery_interval,
+                )
+
             # Listener attached first; snapshot uses get_or_create and won't duplicate dangerously.
             if initial_snapshot:
                 exec_loop = asyncio.get_running_loop()
@@ -198,7 +251,13 @@ async def run_modem_added_listener(
                 await exec_loop.run_in_executor(None, snap)
                 _LOGGER.info('Initial snapshot processed after subscribing (modem %s).', modem_index)
 
-            await bus.wait_for_disconnect()
+            try:
+                await bus.wait_for_disconnect()
+            finally:
+                if recovery_task is not None:
+                    recovery_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await recovery_task
             _LOGGER.warning('D-Bus disconnected for modem path %s; reconnecting...', path)
 
         except DBusError as exc:

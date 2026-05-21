@@ -10,6 +10,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import status
 from rest_framework.generics import GenericAPIView, ListAPIView, RetrieveAPIView
+from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -264,3 +265,19 @@ class DeviceHealthPingView(APIView):
         }
         ser = DeviceHealthPingResponseSerializer(payload)
         return Response(ser.data, status=status.HTTP_200_OK)
+
+
+class SmsMetricsView(APIView):
+    """Operational metrics for inbound SMS reliability pipeline (staff only)."""
+
+    permission_classes = [IsAdminUser]
+
+    @extend_schema(
+        summary='SMS pipeline metrics',
+        description='Counters for D-Bus ingest, queue, persist, DLQ, and periodic recovery.',
+        tags=['Health'],
+    )
+    def get(self, request: Request) -> Response:
+        from apps.sms.metrics import get_metrics_collector
+
+        return Response(get_metrics_collector().get_stats())

@@ -39,7 +39,14 @@ docker compose -f docker/docker-compose.yml build --no-cache
 docker compose -f docker/docker-compose.yml up
 ```
 
-Stop host **ModemManager** / **NetworkManager** before attaching USB modems to the container (see comments in `docker/docker-compose.yml`).
+Stop host **ModemManager** / **NetworkManager** before starting the container — if host MM stays active, the modem often stays **`state: locked`** / **`lock: sim-pin`** inside Docker and SMS/Messaging never comes up:
+
+```bash
+sudo systemctl stop ModemManager NetworkManager
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+Ensure **`.env`** has the correct **`DEVICE_PIN_CODE`** (SIM PIN). On startup you should see `PIN: unlock succeeded` and `modem … state=registered` (or `enabled`) in the container logs.
 
 ### SQLite concurrency (default deploy)
 
@@ -59,3 +66,9 @@ Inside the running container:
 ```bash
 docker compose -f docker/docker-compose.yml exec hiwavetel bash /app/scripts/test_container_env.sh
 ```
+
+
+sudo .venv/bin/python -m pytest tests/test_mqtt_client.py tests/test_external_device.py -q
+
+docker compose -f docker/docker-compose.yml up -d --build
+docker exec -it hiwavetel bash -lc 'mmcli -L; echo MODEM_MMCLI_INDEX=$MODEM_MMCLI_INDEX; mmcli -m $MODEM_MMCLI_INDEX | head'

@@ -56,57 +56,164 @@ def _looks_sqlite_concurrency_error(exc: BaseException) -> bool:
 # retries give the assembled body time to appear. Prefer explicit MM states when possible,
 # plus a hint-based path when SMS metadata exists but texto is empty (multipart assembly gap).
 _RETRY_MMCLI_SHOW_WHILE_STATES = frozenset({'receiving', 'unknown'})
+_STALE_MM_STATES = frozenset({'receiving', 'unknown', ''})
+_TERMINAL_MM_STATES = frozenset({'received', 'stored', 'sent', 'delivered'})
+
+
+def _normalize_mm_state(state: str) -> str:
+    return (state or '').strip().lower()
+
+
+def _inbound_field_should_update(field_name: str, current: str, desired: str) -> bool:
+    """Return True when an existing InboundSms row should be patched from a fresh mmcli snapshot."""
+    cur = (current or '').strip()
+    des = (desired or '').strip()
+    if field_name == 'text':
+        if not des:
+            return False
+        return not cur or len(des) > len(cur)
+    if field_name == 'mm_state':
+        if not des:
+            return False
+        cur_norm = _normalize_mm_state(cur)
+        des_norm = _normalize_mm_state(des)
+        if cur_norm in _STALE_MM_STATES and des_norm not in _STALE_MM_STATES:
+            return True
+        if not cur_norm and des_norm:
+            return True
+        return False
+    if field_name in ('from_number', 'smsc', 'modem_timestamp_raw'):
+        return not cur and bool(des)
+    return False
 
 
 def _should_retry_empty_mmcli_snapshot(raw: dict[str, str], state_norm: str) -> bool:
     """True when texto may still populate after subsequent mmcli snapshots."""
+    sender = extract_from_number(raw).strip()
+    timestamp = extract_timestamp(raw).strip()
+    if (sender or timestamp) and state_norm not in {'failed', 'unknown'}:
+        return True
     if state_norm in _RETRY_MMCLI_SHOW_WHILE_STATES:
         return True
-    if state_norm != '':
-        return False
-    # State unset/omitted briefly; multipart often exposes number/timestamp antes do texto completo.
-    return bool(extract_from_number(raw).strip() or extract_timestamp(raw).strip())
+    return False
 
 
-def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | None = None) -> InboundSms:
-    mm = client or MMCLIClient()
-
-    empty_retries_raw = os.environ.get('MMCLI_EMPTY_TEXT_RETRIES', '5').strip()
+def _fetch_mmcli_snapshot_with_retries(
+    mm: MMCLIClient,
+    mm_path: str,
+    *,
+    metrics,
+) -> dict[str, str]:
+    """Poll mmcli until texto appears, timeout elapses, or state is terminal without texto."""
+    empty_retries_raw = os.environ.get('MMCLI_EMPTY_TEXT_RETRIES', '8').strip()
     empty_backoff_raw = os.environ.get('MMCLI_EMPTY_TEXT_BACKOFF_SEC', '1.5').strip()
+    receiving_max_wait_raw = os.environ.get(
+        'MMCLI_RECEIVING_MAX_WAIT_SEC',
+        str(getattr(settings, 'MMCLI_RECEIVING_MAX_WAIT_SEC', 60)),
+    ).strip()
+
     try:
-        max_snapshot_tries = max(1, int(empty_retries_raw) if empty_retries_raw else 5)
+        max_snapshot_tries = max(1, int(empty_retries_raw) if empty_retries_raw else 8)
     except ValueError:
-        max_snapshot_tries = 5
+        max_snapshot_tries = 8
     try:
         empty_backoff = float(empty_backoff_raw) if empty_backoff_raw else 1.5
     except ValueError:
         empty_backoff = 1.5
     if empty_backoff <= 0:
         empty_backoff = 1.5
+    try:
+        receiving_max_wait_sec = float(receiving_max_wait_raw) if receiving_max_wait_raw else 60.0
+    except ValueError:
+        receiving_max_wait_sec = 60.0
+    if receiving_max_wait_sec <= 0:
+        receiving_max_wait_sec = 60.0
 
     raw: dict[str, str] = {}
-    for snap_attempt in range(max_snapshot_tries):
+    poll_started = time.monotonic()
+    snap_attempt = 0
+    while True:
         try:
             raw = mm.show_sms(mm_path)
         except MmcliError as exc:
             _LOGGER.warning('mmcli show failed for %s: %s', mm_path, exc)
             raw = {}
+
         body = (extract_text(raw) or '').strip()
-        mm_state_norm = extract_state(raw).strip().lower()
+        mm_state_norm = _normalize_mm_state(extract_state(raw))
         if body:
             break
+
+        elapsed = time.monotonic() - poll_started
         keep_trying_because_state = _should_retry_empty_mmcli_snapshot(raw, mm_state_norm)
-        if not keep_trying_because_state or snap_attempt >= max_snapshot_tries - 1:
+        receiving_still_assembling = mm_state_norm == 'receiving' and elapsed < receiving_max_wait_sec
+
+        if receiving_still_assembling or (
+            keep_trying_because_state and snap_attempt < max_snapshot_tries - 1
+        ):
+            metrics.increment('mmcli_show_retries')
+            _LOGGER.info(
+                'Inbound SMS snapshot empty texto (multipart/race?): mm_path=%s state=%s '
+                'attempt=%s elapsed=%.1fs max_wait=%.1fs; retry in %.2fs',
+                mm_path,
+                mm_state_norm or '(unset)',
+                snap_attempt + 1,
+                elapsed,
+                receiving_max_wait_sec,
+                empty_backoff,
+            )
+            time.sleep(empty_backoff)
+            snap_attempt += 1
+            continue
+
+        if mm_state_norm in _TERMINAL_MM_STATES:
             break
-        _LOGGER.info(
-            'Inbound SMS snapshot empty texto (multipart/race?): mm_path=%s state=%s attempt=%s/%s; retry in %.2fs',
-            mm_path,
-            mm_state_norm or '(unset)',
-            snap_attempt + 1,
-            max_snapshot_tries,
-            empty_backoff,
-        )
+        if not keep_trying_because_state:
+            break
+        if snap_attempt >= max_snapshot_tries - 1 and elapsed >= receiving_max_wait_sec:
+            break
+        if snap_attempt >= max_snapshot_tries - 1:
+            break
+
+        metrics.increment('mmcli_show_retries')
         time.sleep(empty_backoff)
+        snap_attempt += 1
+
+    return raw
+
+
+def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | None = None) -> InboundSms:
+    from .dead_letter_queue import get_sms_dlq
+    from .metrics import get_metrics_collector
+    from .models import InboundSms
+
+    mm = client or MMCLIClient()
+    metrics = get_metrics_collector()
+    debug = getattr(settings, 'SMS_DEBUG_LOGGING', False)
+    log_ctx = {'mm_path': mm_path, 'modem_index': modem_index}
+    if debug:
+        _LOGGER.info('persist_inbound_sms start mm_path=%s modem_index=%s', mm_path, modem_index)
+
+    raw = _fetch_mmcli_snapshot_with_retries(mm, mm_path, metrics=metrics)
+
+    sms_class = (raw.get('smspropertiesclass') or raw.get('class') or '').lower()
+    if 'multipart' in sms_class:
+        metrics.increment('multipart_detected')
+        _LOGGER.warning(
+            'Multipart SMS detected at %s - check for other segments. '
+            'Application does not reassemble multipart automatically.',
+            mm_path,
+        )
+
+    if debug:
+        body_preview_len = len((extract_text(raw) or '').strip())
+        _LOGGER.debug(
+            'mmcli snapshot complete mm_path=%s body_length=%s has_sender=%s',
+            mm_path,
+            body_preview_len,
+            bool(extract_from_number(raw).strip()),
+            extra={**log_ctx, 'body_length': body_preview_len},
+        )
 
     defaults = {
         'modem_index': modem_index,
@@ -116,6 +223,29 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
         'smsc': extract_smsc(raw),
         'modem_timestamp_raw': extract_timestamp(raw),
     }
+
+    # Inbound whitelist check
+    whitelist = getattr(settings, 'SMS_INBOUND_WHITELIST', [])
+    if whitelist:
+        from_num = defaults['from_number']
+        if from_num not in whitelist:
+            metrics.increment('inbound_whitelist_rejected')
+            _LOGGER.warning(
+                'SMS rejected by inbound whitelist: from=%s mm_path=%s (allowed: %s)',
+                from_num,
+                mm_path,
+                ', '.join(whitelist),
+                extra={**log_ctx, 'from_number': from_num, 'whitelist': whitelist},
+            )
+            # Create a dummy object that won't be saved but satisfies caller expectations
+            dummy = InboundSms(
+                mm_path=mm_path,
+                modem_index=modem_index,
+                from_number=from_num,
+                text='[REJECTED BY WHITELIST]',
+                mm_state='rejected',
+            )
+            return dummy
 
     from django.db import connection
 
@@ -175,16 +305,73 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     if not created:
         patched = {}
         for field_name, desired in defaults.items():
+            if field_name == 'modem_index':
+                continue
             current = getattr(obj, field_name)
-            if isinstance(current, str) and not current.strip() and isinstance(desired, str) and desired.strip():
+            if not isinstance(current, str) or not isinstance(desired, str):
+                continue
+            if _inbound_field_should_update(field_name, current, desired):
                 patched[field_name] = desired
         if patched:
-            _LOGGER.debug('InboundSms pk=%s updated fields: %s', obj.pk, list(patched.keys()))
+            _LOGGER.info(
+                'InboundSms pk=%s refreshed fields from modem: %s',
+                obj.pk,
+                list(patched.keys()),
+            )
             for key, val in patched.items():
                 setattr(obj, key, val)
             obj.save(update_fields=list(patched.keys()))
 
+    metrics.increment('persist_success')
+    if not (obj.text or '').strip():
+        metrics.increment('empty_text_persisted')
+
+    dlq = get_sms_dlq()
+    if dlq is not None:
+        dlq.remove_by_path(mm_path)
+
     return obj
+
+
+def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, int]:
+    """Re-fetch mmcli snapshots for rows stuck with empty text or non-terminal mm_state."""
+    from django.db.models import Q
+
+    qs = InboundSms.objects.filter(
+        Q(text='') | Q(text__isnull=True) | Q(mm_state__iexact='receiving') | Q(mm_state__iexact='unknown') | Q(mm_state='')
+    )
+    if modem_index is not None:
+        qs = qs.filter(modem_index=modem_index)
+
+    stats = {'checked': 0, 'text_filled': 0, 'state_updated': 0, 'still_stale': 0}
+    for row in qs.order_by('pk').iterator(chunk_size=100):
+        stats['checked'] += 1
+        before_text = (row.text or '').strip()
+        before_state = _normalize_mm_state(row.mm_state)
+        try:
+            updated = persist_inbound_sms(row.mm_path, row.modem_index, None)
+        except Exception as exc:
+            _LOGGER.warning(
+                'refresh_stale_inbound_sms_rows failed pk=%s path=%s: %s',
+                row.pk,
+                row.mm_path,
+                exc,
+            )
+            stats['still_stale'] += 1
+            continue
+
+        after_text = (updated.text or '').strip()
+        after_state = _normalize_mm_state(updated.mm_state)
+        if not before_text and after_text:
+            stats['text_filled'] += 1
+        if before_state in _STALE_MM_STATES and after_state not in _STALE_MM_STATES:
+            stats['state_updated'] += 1
+        if not after_text or after_state in _STALE_MM_STATES:
+            stats['still_stale'] += 1
+
+    if stats['checked']:
+        _LOGGER.info('refresh_stale_inbound_sms_rows stats=%s modem_index=%s', stats, modem_index)
+    return stats
 
 
 def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None = None) -> OutboundSms:

@@ -241,19 +241,18 @@ class MMCLIClient:
         metadata is present — we merge both snapshots and prefer the longest
         non-empty string per field so concatenated/long bodies are not dropped.
         """
-        cp_kv = self._run([self.mmcli_path, "-s", sms_path, "--output-keyvalue"])
-        if cp_kv.returncode != 0:
-            raise MmcliError(
-                'Failed to inspect SMS (--output-keyvalue)',
-                stdout=cp_kv.stdout or '',
-                stderr=cp_kv.stderr or '',
-                exit_code=cp_kv.returncode,
-            )
+        cp_kv = self._retrying_run(
+            [self.mmcli_path, '-s', sms_path, '--output-keyvalue'],
+            'show-kv',
+        )
         kv_data = _parse_keyvalue(cp_kv.stdout or '')
 
         js_data: dict[str, str] = {}
-        cp_js = self._run([self.mmcli_path, "-s", sms_path, '--output-json'])
-        if cp_js.returncode == 0 and (cp_js.stdout or '').strip():
+        cp_js = self._retrying_run(
+            [self.mmcli_path, '-s', sms_path, '--output-json'],
+            'show-json',
+        )
+        if cp_js.stdout and cp_js.stdout.strip():
             try:
                 js_data = _normalize_mmcli_json(cp_js.stdout or '')
             except (json.JSONDecodeError, ValueError):
@@ -262,7 +261,7 @@ class MMCLIClient:
         if merged_main:
             return merged_main
 
-        cp_plain = self._run([self.mmcli_path, '-s', sms_path])
+        cp_plain = self._retrying_run([self.mmcli_path, '-s', sms_path], 'show-plain')
         self._ensure_ok(cp_plain, 'mmcli -s show')
         fallback = _parse_keyvalue(cp_plain.stdout or '')
         merged_fb = _merge_mmcli_sources(kv_data, js_data, fallback)

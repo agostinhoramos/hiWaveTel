@@ -5,10 +5,17 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.test import override_settings
 
 from apps.sms.mmcli_client import MMCLIClient, MmcliError
 from apps.sms.models import InboundSms, OutboundSms
-from apps.sms.services import dispatch_outbound_mmcli, format_public_mmcli_error, persist_inbound_sms
+from apps.sms.services import (
+    _inbound_field_should_update,
+    dispatch_outbound_mmcli,
+    format_public_mmcli_error,
+    persist_inbound_sms,
+    refresh_stale_inbound_sms_rows,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -53,6 +60,115 @@ def test_persist_patches_existing_blank_strings():
     obj.refresh_from_db()
     assert obj.from_number == '+4498765432111'
     assert obj.text == 'patched'
+
+
+def test_inbound_field_should_update_mm_state_from_receiving():
+    assert _inbound_field_should_update('mm_state', 'receiving', 'received') is True
+    assert _inbound_field_should_update('mm_state', 'received', 'receiving') is False
+
+
+def test_inbound_field_should_update_text_when_longer():
+    assert _inbound_field_should_update('text', '', 'hello') is True
+    assert _inbound_field_should_update('text', 'hi', 'hello world') is True
+    assert _inbound_field_should_update('text', 'hello world', 'hi') is False
+
+
+def test_patch_updates_mm_state_from_receiving_to_received():
+    path = '/org/freedesktop/ModemManager1/SMS/stuck101'
+    InboundSms.objects.create(
+        mm_path=path,
+        modem_index=0,
+        from_number='+351961343706',
+        text='',
+        mm_state='receiving',
+    )
+    client = MMCLIClient()
+    client.show_sms = MagicMock(
+        return_value={
+            'number': '+351961343706',
+            'text': 'second message body',
+            'state': 'received',
+        },
+    )
+    obj = persist_inbound_sms(path, 0, client)
+    obj.refresh_from_db()
+    assert obj.mm_state == 'received'
+    assert obj.text == 'second message body'
+
+
+def test_receiving_polls_until_text_arrives():
+    path = '/org/freedesktop/ModemManager1/SMS/poll1'
+    client = MMCLIClient()
+    client.show_sms = MagicMock(
+        side_effect=[
+            {'number': '+351900000001', 'text': '', 'state': 'receiving'},
+            {'number': '+351900000001', 'text': '', 'state': 'receiving'},
+            {'number': '+351900000001', 'text': 'finally', 'state': 'received'},
+        ],
+    )
+    with patch('apps.sms.services.time.sleep'), patch.dict(
+        'os.environ',
+        {'MMCLI_RECEIVING_MAX_WAIT_SEC': '60', 'MMCLI_EMPTY_TEXT_RETRIES': '8'},
+    ):
+        obj = persist_inbound_sms(path, 0, client)
+    assert obj.text == 'finally'
+    assert client.show_sms.call_count == 3
+
+
+def test_refresh_stale_inbound_sms_rows_fills_stuck_row():
+    path = '/org/freedesktop/ModemManager1/SMS/stale1'
+    InboundSms.objects.create(
+        mm_path=path,
+        modem_index=0,
+        from_number='+351961343706',
+        text='',
+        mm_state='receiving',
+    )
+    client = MMCLIClient()
+    client.show_sms = MagicMock(
+        return_value={
+            'number': '+351961343706',
+            'text': 'recovered via stale refresh',
+            'state': 'received',
+        },
+    )
+    with patch('apps.sms.services.MMCLIClient', return_value=client):
+        stats = refresh_stale_inbound_sms_rows(modem_index=0)
+    row = InboundSms.objects.get(mm_path=path)
+    assert stats['checked'] == 1
+    assert stats['text_filled'] == 1
+    assert row.text == 'recovered via stale refresh'
+    assert row.mm_state == 'received'
+
+
+@override_settings(MQTT_REMOTE_BRIDGE_ENABLED=False)
+def test_post_save_requeues_mirror_when_text_patched():
+    path = '/org/freedesktop/ModemManager1/SMS/mirror_patch'
+    InboundSms.objects.create(
+        mm_path=path,
+        modem_index=0,
+        from_number='+351900000001',
+        text='',
+        mm_state='receiving',
+    )
+    client = MMCLIClient()
+    client.show_sms = MagicMock(
+        return_value={
+            'number': '+351900000001',
+            'text': 'mirror me',
+            'state': 'received',
+        },
+    )
+    with patch.dict('os.environ', {'INBOUND_PROCESSOR_WORKERS': '0'}):
+        import apps.sms.inbound_processor as ip
+
+        ip._global_processor = None
+        with patch(
+            'apps.external_device.services.sync_single_inbound_to_all_devices',
+        ) as mock_sync:
+            with patch('django.db.transaction.on_commit', side_effect=lambda fn: fn()):
+                persist_inbound_sms(path, 0, client)
+        mock_sync.assert_called()
 
 
 def test_dispatch_success_updates_state():
