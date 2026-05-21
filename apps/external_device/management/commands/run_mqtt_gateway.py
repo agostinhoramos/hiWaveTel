@@ -8,7 +8,7 @@ from django.core.management.base import BaseCommand
 from apps.external_device.hidishelink_client import HiDishelinkApiError
 from apps.external_device.models import HiDishelinkDevice
 from apps.external_device.mqtt_client import LocalGatewayClient, RemoteHiDishelinkClient
-from apps.external_device.mqtt_config_remote import fetch_mqtt_config_for_hidishelink_row
+from apps.external_device.mqtt_config_remote import resolve_mqtt_config_for_hidishelink_row
 
 
 class Command(BaseCommand):
@@ -28,15 +28,57 @@ class Command(BaseCommand):
             )
             return
         
+        # Read startup refresh setting (default False = use cache when available)
+        refresh = getattr(settings, 'MQTT_CONFIG_STARTUP_REFRESH', False)
+        
+        # Resolve mqtt-config once when both clients use the same HiDishelinkDevice
+        shared_cfg = None
+        shared_device_id = None
+        
+        if remote_enabled and local_enabled:
+            remote_device_id = getattr(settings, 'MQTT_REMOTE_DEVICE_ID', '').strip()
+            if not remote_device_id:
+                hid_row = (
+                    HiDishelinkDevice.objects.filter(status=HiDishelinkDevice.Status.ACTIVE)
+                    .exclude(api_url='')
+                    .exclude(api_key='')
+                    .order_by('-mqtt_config_fetched_at', '-updated_at')
+                    .first()
+                )
+                if hid_row:
+                    remote_device_id = hid_row.device_id
+            
+            if remote_device_id:
+                hid_cred = (
+                    HiDishelinkDevice.objects.filter(
+                        device_id=remote_device_id,
+                        status=HiDishelinkDevice.Status.ACTIVE,
+                    )
+                    .exclude(api_url='')
+                    .exclude(api_key='')
+                    .first()
+                )
+                if hid_cred:
+                    shared_cfg, source = self._resolve_mqtt_cfg(hid_cred, refresh=refresh, label='Shared')
+                    if shared_cfg:
+                        shared_device_id = remote_device_id
+        
         # Start remote hiDisheLink bridge client
         remote_thread = None
         if remote_enabled:
-            remote_thread = self._start_remote_client()
+            remote_thread = self._start_remote_client(
+                mqtt_cfg=shared_cfg,
+                device_id=shared_device_id,
+                refresh=refresh,
+            )
         
         # Start local gateway client (for Android devices)
         local_thread = None
         if local_enabled:
-            local_thread = self._start_local_client()
+            local_thread = self._start_local_client(
+                mqtt_cfg=shared_cfg,
+                refresh=refresh,
+            )
         
         # Wait for threads
         self.stdout.write(self.style.SUCCESS('MQTT gateway clients running...'))
@@ -46,10 +88,49 @@ class Command(BaseCommand):
         if local_thread:
             local_thread.join()
     
-    def _start_remote_client(self):
+    def _resolve_mqtt_cfg(
+        self,
+        hid: HiDishelinkDevice,
+        *,
+        refresh: bool,
+        label: str,
+    ) -> tuple[dict | None, str]:
+        """Resolve mqtt-config using cache-first resolver.
+
+        Returns:
+            Tuple of (config_dict | None, source) where source is 'remote' or 'cache'.
+        """
+        try:
+            cfg, source = resolve_mqtt_config_for_hidishelink_row(hid, refresh=refresh)
+            if source == 'remote':
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f'{label}: fetched MQTT config from hiDisheLink API (device {hid.device_id}).'
+                    )
+                )
+            else:
+                fetched_at = hid.mqtt_config_fetched_at.isoformat() if hid.mqtt_config_fetched_at else 'unknown'
+                self.stdout.write(
+                    f'{label}: using cached MQTT config for device {hid.device_id} (fetched_at={fetched_at}).'
+                )
+            return cfg, source
+        except HiDishelinkApiError as exc:
+            self.stderr.write(
+                self.style.WARNING(f'{label}: mqtt-config unavailable ({exc}).')
+            )
+            return None, 'error'
+    
+    def _start_remote_client(
+        self,
+        *,
+        mqtt_cfg: dict | None = None,
+        device_id: str | None = None,
+        refresh: bool = False,
+    ):
         """Start RemoteHiDishelinkClient thread."""
         # Determine device_id
-        device_id = getattr(settings, 'MQTT_REMOTE_DEVICE_ID', '').strip()
+        if not device_id:
+            device_id = getattr(settings, 'MQTT_REMOTE_DEVICE_ID', '').strip()
         
         if not device_id:
             # Try to get from first active HiDishelinkDevice
@@ -69,31 +150,20 @@ class Command(BaseCommand):
                 )
                 return None
         
-        # Fetch mqtt-config
-        mqtt_cfg = None
-        hid_cred = (
-            HiDishelinkDevice.objects.filter(
-                device_id=device_id,
-                status=HiDishelinkDevice.Status.ACTIVE,
+        # Resolve mqtt-config if not already provided
+        if mqtt_cfg is None:
+            hid_cred = (
+                HiDishelinkDevice.objects.filter(
+                    device_id=device_id,
+                    status=HiDishelinkDevice.Status.ACTIVE,
+                )
+                .exclude(api_url='')
+                .exclude(api_key='')
+                .first()
             )
-            .exclude(api_url='')
-            .exclude(api_key='')
-            .first()
-        )
-        
-        if hid_cred:
-            try:
-                mqtt_cfg = fetch_mqtt_config_for_hidishelink_row(hid_cred)
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f'Remote bridge: fetched MQTT config from hiDisheLink API (device {device_id}).'
-                    )
-                )
-            except HiDishelinkApiError as exc:
-                self.stderr.write(
-                    self.style.WARNING(f'Remote bridge: mqtt-config fetch failed ({exc}); trying cached.')
-                )
-                mqtt_cfg = hid_cred.mqtt_config if isinstance(hid_cred.mqtt_config, dict) else None
+            
+            if hid_cred:
+                mqtt_cfg, _ = self._resolve_mqtt_cfg(hid_cred, refresh=refresh, label='Remote bridge')
         
         if mqtt_cfg is None:
             # Try cached config from any active device with same device_id
@@ -143,31 +213,20 @@ class Command(BaseCommand):
         )
         return thread
     
-    def _start_local_client(self):
+    def _start_local_client(self, *, mqtt_cfg: dict | None = None, refresh: bool = False):
         """Start LocalGatewayClient thread (legacy GatewayMqttClient)."""
-        # Try to get mqtt-config from any active HiDishelinkDevice for local broker settings
-        mqtt_cfg = None
-        hid_cred = (
-            HiDishelinkDevice.objects.filter(status=HiDishelinkDevice.Status.ACTIVE)
-            .exclude(api_url='')
-            .exclude(api_key='')
-            .order_by('-mqtt_config_fetched_at', '-updated_at')
-            .first()
-        )
-        
-        if hid_cred:
-            try:
-                mqtt_cfg = fetch_mqtt_config_for_hidishelink_row(hid_cred)
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f'Local gateway: fetched MQTT config from hiDisheLink API (device {hid_cred.device_id}).'
-                    )
-                )
-            except HiDishelinkApiError as exc:
-                self.stderr.write(
-                    self.style.WARNING(f'Local gateway: mqtt-config fetch failed ({exc}); trying cached.')
-                )
-                mqtt_cfg = hid_cred.mqtt_config if isinstance(hid_cred.mqtt_config, dict) else None
+        # Resolve mqtt-config if not already provided
+        if mqtt_cfg is None:
+            hid_cred = (
+                HiDishelinkDevice.objects.filter(status=HiDishelinkDevice.Status.ACTIVE)
+                .exclude(api_url='')
+                .exclude(api_key='')
+                .order_by('-mqtt_config_fetched_at', '-updated_at')
+                .first()
+            )
+            
+            if hid_cred:
+                mqtt_cfg, _ = self._resolve_mqtt_cfg(hid_cred, refresh=refresh, label='Local gateway')
         
         if mqtt_cfg is None:
             hid_snap = (

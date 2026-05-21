@@ -25,6 +25,21 @@ _LOGGER = logging.getLogger(__name__)
 # Global remote client instance (set by run_mqtt_gateway command)
 _global_remote_client = None
 
+# Device ID sanitization cache to avoid O(N) table scans on every MQTT message
+# Maps sanitized_id -> canonical device_id
+_device_id_cache: dict[str, str | None] = {}
+_device_id_cache_lock = threading.Lock()
+
+
+def clear_device_id_cache() -> None:
+    """Clear the device ID sanitization cache.
+    
+    Should be called when ExternalDevice or HiDishelinkDevice instances are saved/deleted.
+    """
+    with _device_id_cache_lock:
+        _device_id_cache.clear()
+        _LOGGER.debug('Device ID sanitization cache cleared')
+
 
 def _paho_client_connected(client: mqtt.Client) -> bool:
     """Return True if the persistent client believes it has a broker session."""
@@ -167,6 +182,43 @@ def mqtt_flat_cfg_for_device_id(device_id: str) -> dict[str, Any]:
     if isinstance(raw, dict):
         return dict(raw)
     return {}
+
+
+def resolve_remote_bridge_target() -> tuple[str | None, dict[str, Any]]:
+    """Resolve remote bridge ``device_id`` and cached mqtt-config (no HTTP fetch).
+
+    Used by the SMS watcher process when ``_global_remote_client`` is not available
+    (``run_mqtt_gateway`` runs in a separate OS process).
+    """
+    device_id = getattr(settings, 'MQTT_REMOTE_DEVICE_ID', '').strip()
+    if not device_id:
+        hid_row = (
+            HiDishelinkDevice.objects.filter(status=HiDishelinkDevice.Status.ACTIVE)
+            .order_by('-mqtt_config_fetched_at', '-updated_at')
+            .first()
+        )
+        if hid_row:
+            device_id = str(hid_row.device_id).strip()
+
+    if not device_id:
+        return None, {}
+
+    cfg = mqtt_flat_cfg_for_device_id(device_id)
+    if cfg:
+        return device_id, cfg
+
+    hid_snap = (
+        HiDishelinkDevice.objects.filter(
+            device_id=device_id,
+            status=HiDishelinkDevice.Status.ACTIVE,
+        )
+        .exclude(mqtt_config=None)
+        .first()
+    )
+    if hid_snap and isinstance(hid_snap.mqtt_config, dict):
+        return device_id, dict(hid_snap.mqtt_config)
+
+    return device_id, {}
 
 
 def ephemeral_connection_from_flat(cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -943,25 +995,43 @@ class GatewayMqttClient:
         return None
 
     def _find_device_id_by_sanitized(self, sanitized_id: str) -> str | None:
-        """Find canonical device_id by matching sanitized topic segment."""
+        """Find canonical device_id by matching sanitized topic segment (with caching)."""
 
+        # Check cache first
+        with _device_id_cache_lock:
+            if sanitized_id in _device_id_cache:
+                return _device_id_cache[sanitized_id]
+
+        # Cache miss - perform lookup
+        result = None
+        
+        # Fast path: if sanitized_id is all digits, try +NNNN pattern
         if sanitized_id.isdigit():
             candidate = f'+{sanitized_id}'
             found_ed = ExternalDevice.objects.filter(device_id=candidate).values_list('device_id', flat=True).first()
             if found_ed:
-                return found_ed
-            if HiDishelinkDevice.objects.filter(pk=candidate).exists():
-                return candidate
+                result = found_ed
+            elif HiDishelinkDevice.objects.filter(pk=candidate).exists():
+                result = candidate
 
-        for device in ExternalDevice.objects.all():
-            if sanitize_device_id(device.device_id) == sanitized_id:
-                return device.device_id
+        # Slow path: iterate all devices (TODO: add sanitized_device_id field to models)
+        if result is None:
+            for device in ExternalDevice.objects.all():
+                if sanitize_device_id(device.device_id) == sanitized_id:
+                    result = device.device_id
+                    break
 
-        for hid in HiDishelinkDevice.objects.all():
-            if sanitize_device_id(hid.device_id) == sanitized_id:
-                return hid.device_id
+        if result is None:
+            for hid in HiDishelinkDevice.objects.all():
+                if sanitize_device_id(hid.device_id) == sanitized_id:
+                    result = hid.device_id
+                    break
 
-        return None
+        # Cache the result (even if None, to avoid repeated lookups for non-existent devices)
+        with _device_id_cache_lock:
+            _device_id_cache[sanitized_id] = result
+
+        return result
 
 
 def _mqtt_short_client_id() -> str:

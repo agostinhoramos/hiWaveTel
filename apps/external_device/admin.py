@@ -32,6 +32,7 @@ from .models import (
 from .mqtt_client import ephemeral_connection_from_flat, publish_json_ephemeral, sanitize_device_id
 from .services import (
     delete_external_device_and_dependencies,
+    external_device_delete_preview,
     generate_token,
     hash_token,
     process_sms_request,
@@ -123,6 +124,7 @@ def _extract_session(payload: dict) -> tuple[str, object | None]:
 @admin.register(ExternalDevice)
 class ExternalDeviceAdmin(admin.ModelAdmin):
     change_form_template = 'admin/externaldevice_change_form.html'
+    delete_confirmation_template = 'admin/externaldevice_delete_confirmation.html'
 
     list_display = ['device_id', 'name', 'device_type', 'status', 'is_available', 'last_seen', 'created_at']
     list_filter = ['status', 'device_type', 'is_available']
@@ -165,7 +167,12 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
             'fields': ('created_at', 'updated_at'),
         }),
     )
-    actions = ['generate_registration_token', 'sync_inbox_from_modem']
+    actions = [
+        'generate_registration_token',
+        'sync_inbox_from_modem',
+        'delete_device_and_dependencies',
+        'delete_selected_devices_and_dependencies',
+    ]
 
     def generate_registration_token(self, request, queryset):  # type: ignore[override]
         """Generate a registration token for selected devices."""
@@ -222,6 +229,35 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
 
     sync_inbox_from_modem.short_description = 'Sync inbox from modem (select one device)'  # type: ignore[attr-defined]
 
+    def delete_device_and_dependencies(self, request, queryset):  # type: ignore[override]
+        """Redirect to admin delete confirmation for the selected device."""
+        if queryset.count() != 1:
+            self.message_user(request, 'Select exactly one device.', level=messages.ERROR)
+            return None
+
+        device = queryset.first()
+        assert device is not None
+        delete_url = reverse(
+            'admin:%s_%s_delete' % (self.opts.app_label, self.opts.model_name),
+            args=[device.pk],
+            current_app=self.admin_site.name,
+        )
+        return HttpResponseRedirect(delete_url)
+
+    delete_device_and_dependencies.short_description = 'Delete device and dependencies'  # type: ignore[attr-defined]
+
+    def delete_selected_devices_and_dependencies(self, request, queryset):  # type: ignore[override]
+        """Delete selected devices and all cascade dependencies (no Django PROTECT block)."""
+        if not queryset.exists():
+            self.message_user(request, 'Select at least one device.', level=messages.ERROR)
+            return None
+        self.delete_queryset(request, queryset)
+        return None
+
+    delete_selected_devices_and_dependencies.short_description = (  # type: ignore[attr-defined]
+        'Delete selected devices and dependencies'
+    )
+
     def device_inbox_preview(self, obj: ExternalDevice | None) -> str:
         """Recent InboxMessage rows for change form."""
         if obj is None or not obj.pk:
@@ -261,7 +297,24 @@ class ExternalDeviceAdmin(admin.ModelAdmin):
             args=[object_id],
             current_app=self.admin_site.name,
         )
+        extra_context['external_delete_url'] = reverse(
+            'admin:%s_%s_delete' % info,
+            args=[object_id],
+            current_app=self.admin_site.name,
+        )
         return super().change_view(request, object_id, form_url, extra_context=extra_context)
+
+    def delete_view(self, request, object_id, extra_context=None):  # type: ignore[override]
+        extra_context = extra_context or {}
+        obj = self.get_object(request, object_id)
+        if obj is not None:
+            extra_context['delete_preview'] = external_device_delete_preview(obj)
+        return super().delete_view(request, object_id, extra_context=extra_context)
+
+    def get_deleted_objects(self, objs, request):  # type: ignore[override]
+        """Allow admin delete; PROTECT FKs are removed in :meth:`delete_model` cascade."""
+        deleted_objects, model_count, _perms_needed, _protected = super().get_deleted_objects(objs, request)
+        return deleted_objects, model_count, set(), set()
 
     def get_urls(self):  # type: ignore[override]
         info = self.opts.app_label, self.opts.model_name

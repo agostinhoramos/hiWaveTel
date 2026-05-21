@@ -30,6 +30,7 @@ from apps.external_device.models import (
 from apps.external_device.mqtt_client import GatewayMqttClient, sanitize_device_id
 from apps.external_device.services import (
     delete_external_device_and_dependencies,
+    external_device_delete_preview,
     generate_token,
     hash_token,
     persist_inbox_from_mqtt,
@@ -1028,6 +1029,157 @@ class TestExternalDeviceCascadeDelete:
         assert not InboxMessage.objects.filter(message_id='inbox_cascade_del').exists()
         assert not DeviceSession.objects.filter(session_id='s_sess_del_test123456789012345678901234567890').exists()
         assert not DeviceHealthTelemetry.objects.filter(pk=tel.pk).exists()
+
+
+def _device_with_delete_dependencies(device_id: str = '+351913000387') -> ExternalDevice:
+    """Create ExternalDevice with rows that cascade delete removes."""
+    suffix = device_id.replace('+', '').replace(' ', '')[-8:]
+    raw_key = generate_token(32)
+    device = ExternalDevice.objects.create(
+        device_id=device_id,
+        name='Admin Delete Device',
+        api_key_hash=hash_api_key(raw_key),
+        status=ExternalDevice.Status.ACTIVE,
+    )
+    HiDishelinkDevice.objects.create(device_id=device.device_id, api_url='http://example.invalid', api_key='k')
+    DeviceSession.objects.create(
+        session_id=f's_admin_del_{suffix}_123456789012345678901234567890',
+        device=device,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    DeviceHealthTelemetry.objects.create(device=device, raw_payload={'x': 1})
+    req = SmsRequest.objects.create(
+        request_id=f'req_admin_del_{suffix}',
+        device=device,
+        recipients=['+351910000001'],
+        message='delete me',
+    )
+    SmsRecipientStatus.objects.create(request=req, phone_number='+351910000001', status=SmsRecipientStatus.Status.SENT)
+    InboxMessage.objects.create(
+        message_id=f'inbox_admin_del_{suffix}',
+        device=device,
+        sender='+351910000000',
+        body='hi',
+        received_at=timezone.now(),
+    )
+    return device
+
+
+@pytest.mark.django_db
+class TestExternalDeviceAdminDelete:
+    """Admin delete confirmation, cascade action, and E.164 PK URLs."""
+
+    def test_external_device_delete_preview_counts_dependencies(self):
+        device = _device_with_delete_dependencies()
+        preview = external_device_delete_preview(device)
+        assert preview['sms_requests'] == 1
+        assert preview['inbox_messages'] == 1
+        assert preview['device_sessions'] == 1
+        assert preview['health_telemetry'] == 1
+        assert preview['hidishelink_devices'] == 1
+        assert preview['external_devices'] == 1
+
+    def test_admin_delete_get_shows_preview(self, admin_client):
+        device = _device_with_delete_dependencies()
+        delete_url = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        response = admin_client.get(delete_url)
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert device.device_id in content
+        assert 'Dependencies to remove' in content
+        assert 'SMS request' in content or 'SMS requests' in content
+        assert 'inbox message' in content or 'inbox messages' in content
+        assert 'Cannot delete' not in content
+        assert 'protected related objects' not in content.lower()
+
+    def test_admin_delete_get_does_not_block_when_protect_deps_exist(self, admin_client):
+        """PROTECT FKs on SmsRequest/InboxMessage must not show Django Cannot delete page."""
+        device = _device_with_delete_dependencies('+351913000387')
+        delete_url = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        response = admin_client.get(delete_url)
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Cannot delete' not in content
+        assert 'name="post"' in content or 'value="yes"' in content
+
+    def test_admin_delete_post_removes_device_and_dependencies(self, admin_client):
+        device = _device_with_delete_dependencies()
+        delete_url = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        response = admin_client.post(delete_url, {'post': 'yes'})
+        assert response.status_code == 302
+        changelist_url = reverse('admin:external_device_externaldevice_changelist')
+        assert response['Location'].endswith(changelist_url)
+        assert not ExternalDevice.objects.filter(pk=device.device_id).exists()
+        assert not HiDishelinkDevice.objects.filter(pk=device.device_id).exists()
+        assert not SmsRequest.objects.filter(request_id=f'req_admin_del_{device.device_id.replace("+", "").replace(" ", "")[-8:]}').exists()
+        assert not InboxMessage.objects.filter(message_id=f'inbox_admin_del_{device.device_id.replace("+", "").replace(" ", "")[-8:]}').exists()
+
+    def test_admin_delete_e164_pk_url_resolves(self, admin_client):
+        device = _device_with_delete_dependencies('+351913000387')
+        delete_url = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        assert '351913000387' in delete_url
+        response = admin_client.get(delete_url)
+        assert response.status_code == 200
+
+    def test_admin_delete_action_redirects_to_confirmation(self, admin_client):
+        device = _device_with_delete_dependencies('+351913000388')
+        changelist_url = reverse('admin:external_device_externaldevice_changelist')
+        response = admin_client.post(
+            changelist_url,
+            {
+                'action': 'delete_device_and_dependencies',
+                '_selected_action': [device.device_id],
+            },
+        )
+        assert response.status_code == 302
+        expected_delete = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        assert response['Location'].endswith(expected_delete)
+
+    def test_admin_bulk_delete_selected_devices(self, admin_client):
+        device_a = _device_with_delete_dependencies('+351913000390')
+        device_b = _device_with_delete_dependencies('+351913000391')
+        changelist_url = reverse('admin:external_device_externaldevice_changelist')
+        response = admin_client.post(
+            changelist_url,
+            {
+                'action': 'delete_selected_devices_and_dependencies',
+                '_selected_action': [device_a.device_id, device_b.device_id],
+            },
+        )
+        assert response.status_code == 302
+        assert not ExternalDevice.objects.filter(pk__in=[device_a.device_id, device_b.device_id]).exists()
+        assert not HiDishelinkDevice.objects.filter(pk__in=[device_a.device_id, device_b.device_id]).exists()
+
+    def test_admin_change_page_shows_delete_link(self, admin_client):
+        device = _device_with_delete_dependencies('+351913000389')
+        change_url = reverse(
+            'admin:external_device_externaldevice_change',
+            args=[device.device_id],
+        )
+        response = admin_client.get(change_url)
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Delete device' in content
+        delete_url = reverse(
+            'admin:external_device_externaldevice_delete',
+            args=[device.device_id],
+        )
+        assert delete_url in content
 
 
 @pytest.mark.django_db

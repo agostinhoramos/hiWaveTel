@@ -569,14 +569,8 @@ def _mirror_to_device(inbound, device: ExternalDevice) -> tuple[bool, bool, bool
         )
         return (False, True, False)
 
-    if inbound_should_skip_modem_mirror(inbound):
-        _LOGGER.info(
-            'sync_single_inbound_to_all_devices: skipping mmcli mirror device=%s inbound_pk=%s '
-            '(recent manual inbox or outbound echo)',
-            device.device_id,
-            inbound.pk,
-        )
-        return (False, True, False)
+    # Note: inbound_should_skip_modem_mirror check moved to caller
+    # to avoid N×2 database queries (now checked once before device loop)
 
     device_modem_index = metadata.get('modem_index')
 
@@ -674,6 +668,16 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
       ``inbound.modem_index``.
     - If ``modem_index`` is not set, mirror unconditionally (subject to the rules above).
     """
+    # Check dedup rules once upfront (eliminates N queries per device)
+    skip_all_due_to_dedup = inbound_should_skip_modem_mirror(inbound)
+    if skip_all_due_to_dedup:
+        _LOGGER.info(
+            'sync_single_inbound_to_all_devices: skipping all devices for inbound_pk=%s '
+            '(recent manual inbox or outbound echo)',
+            inbound.pk,
+        )
+        return
+    
     active_devices = list(ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE))
     active_count = len(active_devices)
 
@@ -781,6 +785,19 @@ def sync_single_inbound_to_all_devices(inbound) -> None:
         skipped_count,
         active_count,
     )
+
+
+def external_device_delete_preview(device: ExternalDevice) -> dict[str, int]:
+    """Counts of rows removed by :func:`delete_external_device_and_dependencies` (read-only)."""
+    pk = device.device_id
+    return {
+        'sms_requests': SmsRequest.objects.filter(device=device).count(),
+        'inbox_messages': InboxMessage.objects.filter(device=device).count(),
+        'device_sessions': DeviceSession.objects.filter(device=device).count(),
+        'health_telemetry': DeviceHealthTelemetry.objects.filter(device=device).count(),
+        'hidishelink_devices': HiDishelinkDevice.objects.filter(pk=pk).count(),
+        'external_devices': 1,
+    }
 
 
 def delete_external_device_and_dependencies(device: ExternalDevice) -> dict[str, int]:
@@ -1030,4 +1047,68 @@ def publish_inbound_to_remote(inbound, remote_client) -> bool:
             message_id,
         )
     
+    return success
+
+
+def publish_inbound_to_remote_ephemeral(inbound) -> bool:
+    """Publish InboundSms to remote hiDisheLink broker via one-off MQTT connection.
+
+    Used when ``_global_remote_client`` is unavailable (e.g. SMS watcher process separate
+    from ``run_mqtt_gateway``). Uses cached ``HiDishelinkDevice.mqtt_config``.
+    """
+    from .mqtt_client import (
+        _publish_json_ephemeral,
+        device_topic_from_flat_config,
+        ephemeral_connection_from_flat,
+        resolve_remote_bridge_target,
+    )
+
+    if not inbound_ready_for_inbox_mirror(inbound):
+        _LOGGER.debug('Inbound SMS not ready for remote ephemeral publish pk=%s', inbound.pk)
+        return False
+
+    if inbound_should_skip_modem_mirror(inbound):
+        _LOGGER.debug('Inbound SMS skipped for remote ephemeral publish pk=%s', inbound.pk)
+        return False
+
+    device_id, mqtt_cfg = resolve_remote_bridge_target()
+    if not device_id or not mqtt_cfg:
+        _LOGGER.warning(
+            'Remote inbox ephemeral: no cached mqtt-config for bridge device (inbound_pk=%s)',
+            inbound.pk,
+        )
+        return False
+
+    topic = device_topic_from_flat_config(
+        mqtt_cfg,
+        'TOPIC_SMS_INBOX',
+        '{prefix}/{sanitized}/sms/inbox',
+        device_id,
+    )
+    conn = ephemeral_connection_from_flat(mqtt_cfg)
+    conn['MQTT_QOS'] = 1
+
+    message_id = f'hidw_inbound_{inbound.pk}_{inbound.modem_index}'
+    payload = {
+        'message_id': message_id,
+        'sender': inbound.from_number or '',
+        'body': inbound.text or '',
+        'timestamp': inbound.created_at.isoformat(),
+    }
+
+    success = _publish_json_ephemeral(topic, payload, conn)
+    if success:
+        _LOGGER.info(
+            'Published InboundSms to remote broker (ephemeral) pk=%s message_id=%s device=%s',
+            inbound.pk,
+            message_id,
+            device_id,
+        )
+    else:
+        _LOGGER.warning(
+            'Failed remote ephemeral inbox publish pk=%s message_id=%s topic=%s',
+            inbound.pk,
+            message_id,
+            topic,
+        )
     return success

@@ -277,6 +277,22 @@ MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = positive_int_env('MQTT_REMOTE_HEALTH_HEARTBEA
 if MQTT_REMOTE_HEALTH_HEARTBEAT_SEC <= 0:
     MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = 60
 
+# Gateway startup: fetch mqtt-config from remote API or use cached snapshot
+MQTT_CONFIG_STARTUP_REFRESH = truthy_env('MQTT_CONFIG_STARTUP_REFRESH', default=False)
+
+# Inbound SMS post-save processor queue (apps/sms/inbound_processor.py)
+# Async processing of InboundSms mirror + MQTT publish with retry logic
+INBOUND_PROCESSOR_WORKERS = positive_int_env('INBOUND_PROCESSOR_WORKERS', 2)
+INBOUND_PROCESSOR_MAX_SIZE = positive_int_env('INBOUND_PROCESSOR_MAX_SIZE', 500)
+INBOUND_PROCESSOR_RETRY_MAX = positive_int_env('INBOUND_PROCESSOR_RETRY_MAX', 5)
+_retry_base_raw = os.environ.get('INBOUND_PROCESSOR_RETRY_BASE_SEC', '1.0').strip()
+try:
+    INBOUND_PROCESSOR_RETRY_BASE_SEC = float(_retry_base_raw) if _retry_base_raw else 1.0
+except ValueError:
+    INBOUND_PROCESSOR_RETRY_BASE_SEC = 1.0
+if INBOUND_PROCESSOR_RETRY_BASE_SEC <= 0:
+    INBOUND_PROCESSOR_RETRY_BASE_SEC = 1.0
+
 # MQTT client tuning (mirrors hiDisheLink mqtt-config; optional fallbacks when no remote config)
 MQTT_AUTO_RECONNECT = truthy_env('MQTT_AUTO_RECONNECT', default=True)
 MQTT_CONNECTION_TIMEOUT = positive_int_env('MQTT_CONNECTION_TIMEOUT', 30)

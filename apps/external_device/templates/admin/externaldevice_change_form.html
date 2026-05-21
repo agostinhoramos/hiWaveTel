@@ -5,4 +5,7 @@
 {% if external_send_sms_url %}
 <li><a href="{{ external_send_sms_url }}" class="addlink">{% trans "Send SMS (modem)" %}</a></li>
 {% endif %}
+{% if external_delete_url %}
+<li><a href="{{ external_delete_url }}" class="deletelink">{% trans "Delete device" %}</a></li>
+{% endif %}
 {% endblock %}

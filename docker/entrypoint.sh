@@ -362,7 +362,12 @@ ensure_sqlite_file "${SQLITE_DB_PATH:-}"
 # Ensure log directory exists before Django boots (paired with SQLite path above).
 mkdir -p "${DJANGO_LOG_DIR:-/app/logs}"
 
-cd /app
+APP_ROOT=/app
+if [[ -f /app/host/manage.py ]]; then
+  APP_ROOT=/app/host
+  echo "Using bind-mounted app source: ${APP_ROOT}"
+fi
+cd "${APP_ROOT}"
 
 python manage.py migrate --noinput
 

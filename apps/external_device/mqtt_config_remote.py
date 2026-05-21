@@ -14,8 +14,56 @@ from .models import HiDishelinkDevice
 _LOGGER = logging.getLogger(__name__)
 
 
-def fetch_mqtt_config_for_hidishelink_row(hid: HiDishelinkDevice) -> dict[str, Any]:
-    """Fetch mqtt-config using ``hid.api_url`` and ``hid.api_key``; persist snapshot on ``hid``."""
+def resolve_mqtt_config_for_hidishelink_row(
+    hid: HiDishelinkDevice,
+    *,
+    refresh: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """Return (flat_config, source) for gateway startup with cache-first behavior.
+
+    Returns:
+        Tuple of (config_dict, source) where source is 'remote' or 'cache'.
+
+    Strategy:
+        - If ``refresh=False`` and cached ``hid.mqtt_config`` is valid dict → return cache immediately.
+        - Otherwise attempt remote fetch via :func:`fetch_mqtt_config_for_hidishelink_row`.
+        - On transport error: if cache exists → return cache (log INFO, no traceback); else re-raise.
+
+    Used by ``run_mqtt_gateway`` startup to avoid noisy connection failures when cached config works.
+    """
+    cached = hid.mqtt_config if isinstance(hid.mqtt_config, dict) and hid.mqtt_config else None
+
+    if not refresh and cached:
+        fetched_at = hid.mqtt_config_fetched_at.isoformat() if hid.mqtt_config_fetched_at else 'unknown'
+        _LOGGER.info(
+            'Using cached mqtt-config device_id=%s fetched_at=%s',
+            hid.device_id,
+            fetched_at,
+        )
+        return cached, 'cache'
+
+    try:
+        flat = fetch_mqtt_config_for_hidishelink_row(hid, log_transport_error=False)
+        return flat, 'remote'
+    except HiDishelinkApiError as exc:
+        if cached:
+            _LOGGER.info(
+                'Remote mqtt-config fetch failed device_id=%s; using cached snapshot (%s)',
+                hid.device_id,
+                exc,
+            )
+            return cached, 'cache'
+        raise
+
+
+def fetch_mqtt_config_for_hidishelink_row(hid: HiDishelinkDevice, *, log_transport_error: bool = True) -> dict[str, Any]:
+    """Fetch mqtt-config using ``hid.api_url`` and ``hid.api_key``; persist snapshot on ``hid``.
+
+    Args:
+        hid: HiDishelinkDevice with api_url and api_key.
+        log_transport_error: If True, log transport errors with full traceback (admin actions).
+                             If False, suppress detailed logging (resolver will handle it).
+    """
     url = str(hid.api_url or '').strip()
     key = str(hid.api_key or '').strip()
     if not url or not key:
@@ -27,11 +75,12 @@ def fetch_mqtt_config_for_hidishelink_row(hid: HiDishelinkDevice) -> dict[str, A
     except HiDishelinkApiError:
         raise
     except requests.RequestException as exc:
-        _LOGGER.warning(
-            'hiDisheLink mqtt-config transport error device_id=%s',
-            hid.device_id,
-            exc_info=True,
-        )
+        if log_transport_error:
+            _LOGGER.warning(
+                'hiDisheLink mqtt-config transport error device_id=%s',
+                hid.device_id,
+                exc_info=True,
+            )
         raise HiDishelinkApiError(f'hiDisheLink unreachable: {exc}', status_code=None, body=None) from exc
 
     flat = mqtt_config_flat(payload)

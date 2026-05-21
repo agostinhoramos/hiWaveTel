@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from drf_spectacular.types import OpenApiTypes
@@ -31,6 +32,11 @@ if TYPE_CHECKING:
     from rest_framework.request import Request
 
 _LOGGER = logging.getLogger(__name__)
+
+# TTL cache for sync_inbox_from_modem_store to prevent expensive 500-query sync on every API GET
+# Maps device_id -> last_sync_timestamp
+_MODEM_INBOX_SYNC_CACHE: dict[str, float] = {}
+_MODEM_INBOX_SYNC_TTL_SEC = 300  # 5 minutes
 
 
 class RegisterDeviceView(APIView):
@@ -166,13 +172,35 @@ class SmsInboxView(ListAPIView):
                 device.metadata,
                 before_count,
             )
-            sync_inbox_from_modem_store(device)
+            
+            # Only sync from modem store if TTL expired (default: 5 minutes)
+            now = time.time()
+            last_sync = _MODEM_INBOX_SYNC_CACHE.get(device.device_id, 0)
+            should_sync = (now - last_sync) > _MODEM_INBOX_SYNC_TTL_SEC
+            
+            if should_sync:
+                _LOGGER.info(
+                    'Inbox sync running for device=%s (last_sync=%.1fs ago)',
+                    device.device_id,
+                    now - last_sync,
+                )
+                sync_inbox_from_modem_store(device)
+                _MODEM_INBOX_SYNC_CACHE[device.device_id] = now
+            else:
+                _LOGGER.debug(
+                    'Inbox sync skipped for device=%s (last_sync=%.1fs ago, ttl=%ds)',
+                    device.device_id,
+                    now - last_sync,
+                    _MODEM_INBOX_SYNC_TTL_SEC,
+                )
+            
             queryset = InboxMessage.objects.filter(device=device)
             after_count = queryset.count()
             _LOGGER.info(
-                'Inbox list response-prep device=%s after_count=%s',
+                'Inbox list response-prep device=%s after_count=%s sync_ran=%s',
                 device.device_id,
                 after_count,
+                should_sync,
             )
             if after_count == 0:
                 _LOGGER.warning(
