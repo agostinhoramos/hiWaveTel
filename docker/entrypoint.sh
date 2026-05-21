@@ -373,6 +373,10 @@ python manage.py migrate --noinput
 
 python manage.py ensure_superuser
 
+if [[ "${FOUND}" == "1" ]]; then
+  python manage.py ensure_hidishelink_device --modem-index "${MODEM_MMCLI_INDEX:-0}"
+fi
+
 if truthy "${SMS_CLEANUP_ON_STARTUP:-false}"; then
   python manage.py cleanup_sms_storage
   echo "SMS storage cleanup completed (SMS_CLEANUP_ON_STARTUP=true)."
