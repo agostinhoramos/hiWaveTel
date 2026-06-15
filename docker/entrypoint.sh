@@ -404,16 +404,20 @@ echo "Interactive shells: MODEM_MMCLI_INDEX=${MODEM_MMCLI_INDEX} (see /etc/profi
 
 if truthy "${RUN_SMS_WATCHER:-}"; then
   MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"
-  python manage.py run_sms_watcher --modem-index "${MODEM_MMCLI_INDEX}" &
+  HIWAVETEL_ROLE=watcher HIWAVETEL_QUEUE_ENABLED=true \
+    python manage.py run_sms_watcher --modem-index "${MODEM_MMCLI_INDEX}" &
   echo "SMS watcher (modem_index=${MODEM_MMCLI_INDEX}) in background."
 fi
 
 if truthy "${RUN_MQTT_GATEWAY:-}"; then
-  python manage.py run_mqtt_gateway &
+  HIWAVETEL_ROLE=mqtt HIWAVETEL_QUEUE_ENABLED=true \
+    python manage.py run_mqtt_gateway &
   echo "MQTT gateway (run_mqtt_gateway) in background."
 fi
 
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"
+export HIWAVETEL_ROLE=api
+export HIWAVETEL_QUEUE_ENABLED=false
 exec gunicorn config.wsgi:application \
   --bind "0.0.0.0:${HIWAVE_PORT}" \
   --workers "${GUNICORN_WORKERS:-2}" \

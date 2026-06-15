@@ -187,6 +187,8 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     from .metrics import get_metrics_collector
     from .models import InboundSms
 
+    from .mmcli_lock import mmcli_serial
+
     mm = client or MMCLIClient()
     metrics = get_metrics_collector()
     debug = getattr(settings, 'SMS_DEBUG_LOGGING', False)
@@ -194,7 +196,8 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     if debug:
         _LOGGER.info('persist_inbound_sms start mm_path=%s modem_index=%s', mm_path, modem_index)
 
-    raw = _fetch_mmcli_snapshot_with_retries(mm, mm_path, metrics=metrics)
+    with mmcli_serial():
+        raw = _fetch_mmcli_snapshot_with_retries(mm, mm_path, metrics=metrics)
 
     sms_class = (raw.get('smspropertiesclass') or raw.get('class') or '').lower()
     if 'multipart' in sms_class:
@@ -377,33 +380,36 @@ def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, 
 def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None = None) -> OutboundSms:
     """Drive mmcli create/send after ``OutboundSms`` DB row creation; mutates outbound state on failure."""
 
+    from .mmcli_lock import mmcli_serial
+
     mm = client or MMCLIClient()
-    try:
-        modem_ix = outbound.modem_index
-        if client is None:
-            modem_ix = resolve_modem_mmcli_index(modem_ix, client=mm)
-            if modem_ix != outbound.modem_index:
-                outbound.modem_index = modem_ix
-                outbound.save(update_fields=('modem_index',))
-            prepare_modem_for_outbound_sms(modem_ix, mmcli_path=mm.mmcli_path)
-        else:
-            mm.ensure_modem_index(modem_ix)
-        sms_path = mm.create_sms(modem_ix, outbound.to_number, outbound.text)
-        outbound.mm_path = sms_path
-        outbound.state = OutboundSms.State.SENDING
-        outbound.save(update_fields=('mm_path', 'state'))
+    with mmcli_serial():
+        try:
+            modem_ix = outbound.modem_index
+            if client is None:
+                modem_ix = resolve_modem_mmcli_index(modem_ix, client=mm)
+                if modem_ix != outbound.modem_index:
+                    outbound.modem_index = modem_ix
+                    outbound.save(update_fields=('modem_index',))
+                prepare_modem_for_outbound_sms(modem_ix, mmcli_path=mm.mmcli_path)
+            else:
+                mm.ensure_modem_index(modem_ix)
+            sms_path = mm.create_sms(modem_ix, outbound.to_number, outbound.text)
+            outbound.mm_path = sms_path
+            outbound.state = OutboundSms.State.SENDING
+            outbound.save(update_fields=('mm_path', 'state'))
 
-        mm.send_sms(sms_path)
+            mm.send_sms(sms_path)
 
-        outbound.state = OutboundSms.State.SENT
-        outbound.save(update_fields=('state',))
-        return outbound
-    except MmcliError as exc:
-        outbound.state = OutboundSms.State.FAILED
-        outbound.error_message = format_public_mmcli_error(exc)
-        outbound.save(update_fields=('state', 'error_message'))
-        _LOGGER.warning('Outbound id=%s failed: %s', outbound.pk, exc)
-        return outbound
+            outbound.state = OutboundSms.State.SENT
+            outbound.save(update_fields=('state',))
+            return outbound
+        except MmcliError as exc:
+            outbound.state = OutboundSms.State.FAILED
+            outbound.error_message = format_public_mmcli_error(exc)
+            outbound.save(update_fields=('state', 'error_message'))
+            _LOGGER.warning('Outbound id=%s failed: %s', outbound.pk, exc)
+            return outbound
 
 
 def _delete_oldest_modem_rows(

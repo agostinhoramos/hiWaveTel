@@ -325,6 +325,24 @@ except ValueError:
 if INBOUND_PROCESSOR_RETRY_BASE_SEC <= 0:
     INBOUND_PROCESSOR_RETRY_BASE_SEC = 1.0
 
+# Outbound SMS async processor (apps/sms/outbound_processor.py)
+OUTBOUND_ASYNC_ENABLED = truthy_env('OUTBOUND_ASYNC_ENABLED', default=False)
+OUTBOUND_PROCESSOR_WORKERS = positive_int_env('OUTBOUND_PROCESSOR_WORKERS', 1)
+OUTBOUND_PROCESSOR_MAX_SIZE = positive_int_env('OUTBOUND_PROCESSOR_MAX_SIZE', 10000)
+_outbox_poll_raw = os.environ.get('OUTBOUND_OUTBOX_POLL_SEC', '0.1').strip()
+try:
+    OUTBOUND_OUTBOX_POLL_SEC = float(_outbox_poll_raw) if _outbox_poll_raw else 0.1
+except ValueError:
+    OUTBOUND_OUTBOX_POLL_SEC = 0.1
+
+# MQTT handler offload queue (apps/external_device/mqtt_handler_queue.py)
+MQTT_HANDLER_QUEUE_ENABLED = truthy_env('MQTT_HANDLER_QUEUE_ENABLED', default=True)
+MQTT_HANDLER_WORKERS = positive_int_env('MQTT_HANDLER_WORKERS', 3)
+MQTT_HANDLER_MAX_SIZE = positive_int_env('MQTT_HANDLER_MAX_SIZE', 5000)
+MQTT_HANDLER_LOAD_SHED_THRESHOLD = positive_int_env('MQTT_HANDLER_LOAD_SHED_THRESHOLD', 100)
+MQTT_LOAD_SHED_HEALTH = truthy_env('MQTT_LOAD_SHED_HEALTH', default=True)
+MQTT_PERSISTENT_PUBLISH = truthy_env('MQTT_PERSISTENT_PUBLISH', default=True)
+
 # MQTT client tuning (mirrors hiDisheLink mqtt-config; optional fallbacks when no remote config)
 MQTT_AUTO_RECONNECT = truthy_env('MQTT_AUTO_RECONNECT', default=True)
 MQTT_CONNECTION_TIMEOUT = positive_int_env('MQTT_CONNECTION_TIMEOUT', 30)
@@ -354,8 +372,8 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/day',
-        'user': '1000/day',
+        'anon': os.environ.get('DRF_THROTTLE_ANON_RATE', '100/day'),
+        'user': os.environ.get('DRF_THROTTLE_USER_RATE', '1000/day'),
     },
 }
 

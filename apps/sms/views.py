@@ -133,7 +133,12 @@ class OutboundSmsViewSet(
             state=OutboundSms.State.CREATED,
         )
 
-        dispatch_outbound_mmcli(outbound)
+        from apps.sms.outbound_processor import enqueue_outbound_job, outbound_async_enabled
+
+        if outbound_async_enabled():
+            enqueue_outbound_job('outbound', str(outbound.pk), priority='normal')
+        else:
+            dispatch_outbound_mmcli(outbound)
 
         out = OutboundSmsSerializer(outbound, context={'request': request})
         return Response(out.data, status=status.HTTP_202_ACCEPTED)

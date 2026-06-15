@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING
 
 from drf_spectacular.types import OpenApiTypes
@@ -27,17 +26,12 @@ from .serializers import (
     SmsSendResponseSerializer,
     SmsStatusResponseSerializer,
 )
-from .services import persist_inbox_from_mqtt, process_sms_request, register_device, sync_inbox_from_modem_store
+from .services import persist_inbox_from_mqtt, process_sms_request, register_device
 
 if TYPE_CHECKING:
     from rest_framework.request import Request
 
 _LOGGER = logging.getLogger(__name__)
-
-# TTL cache for sync_inbox_from_modem_store to prevent expensive 500-query sync on every API GET
-# Maps device_id -> last_sync_timestamp
-_MODEM_INBOX_SYNC_CACHE: dict[str, float] = {}
-_MODEM_INBOX_SYNC_TTL_SEC = 300  # 5 minutes
 
 
 class RegisterDeviceView(APIView):
@@ -74,6 +68,7 @@ class SmsSendView(APIView):
 
     authentication_classes = [ApiKeyAuthentication]
     permission_classes = [IsActiveExternalDevice]
+    throttle_classes: list = []
 
     @extend_schema(
         request=SmsSendRequestSerializer,
@@ -112,6 +107,7 @@ class SmsStatusView(GenericAPIView):
     authentication_classes = [ApiKeyAuthentication]
     permission_classes = [IsActiveExternalDevice]
     serializer_class = SmsStatusResponseSerializer
+    throttle_classes: list = []
 
     @extend_schema(
         summary='Get SMS status',
@@ -155,6 +151,7 @@ class SmsInboxView(ListAPIView):
     authentication_classes = [ApiKeyAuthentication]
     permission_classes = [IsActiveExternalDevice]
     serializer_class = InboxMessageSerializer
+    throttle_classes: list = []
 
     @extend_schema(
         summary='List inbox messages',
@@ -162,53 +159,10 @@ class SmsInboxView(ListAPIView):
         tags=['SMS'],
     )
     def get_queryset(self):  # type: ignore[override]
-        """Filter inbox by authenticated device."""
+        """Filter inbox by authenticated device (read-only; sync runs in background watcher)."""
         device = self.request.user
         if isinstance(device, ExternalDevice):
-            before_count = InboxMessage.objects.filter(device=device).count()
-            _LOGGER.info(
-                'Inbox list request device=%s status=%s metadata=%s before_count=%s',
-                device.device_id,
-                device.status,
-                device.metadata,
-                before_count,
-            )
-            
-            # Only sync from modem store if TTL expired (default: 5 minutes)
-            now = time.time()
-            last_sync = _MODEM_INBOX_SYNC_CACHE.get(device.device_id, 0)
-            should_sync = (now - last_sync) > _MODEM_INBOX_SYNC_TTL_SEC
-            
-            if should_sync:
-                _LOGGER.info(
-                    'Inbox sync running for device=%s (last_sync=%.1fs ago)',
-                    device.device_id,
-                    now - last_sync,
-                )
-                sync_inbox_from_modem_store(device)
-                _MODEM_INBOX_SYNC_CACHE[device.device_id] = now
-            else:
-                _LOGGER.debug(
-                    'Inbox sync skipped for device=%s (last_sync=%.1fs ago, ttl=%ds)',
-                    device.device_id,
-                    now - last_sync,
-                    _MODEM_INBOX_SYNC_TTL_SEC,
-                )
-            
-            queryset = InboxMessage.objects.filter(device=device)
-            after_count = queryset.count()
-            _LOGGER.info(
-                'Inbox list response-prep device=%s after_count=%s sync_ran=%s',
-                device.device_id,
-                after_count,
-                should_sync,
-            )
-            if after_count == 0:
-                _LOGGER.warning(
-                    'Inbox list device=%s returned empty results after modem sync',
-                    device.device_id,
-                )
-            return queryset
+            return InboxMessage.objects.filter(device=device)
         return InboxMessage.objects.none()
 
 
@@ -279,5 +233,36 @@ class SmsMetricsView(APIView):
     )
     def get(self, request: Request) -> Response:
         from apps.sms.metrics import get_metrics_collector
+        from apps.sms.mmcli_lock import get_mmcli_lock_metrics
 
-        return Response(get_metrics_collector().get_stats())
+        stats = get_metrics_collector().get_stats()
+        stats.update(get_mmcli_lock_metrics())
+
+        try:
+            from apps.sms.inbound_processor import get_inbound_processor
+
+            proc = get_inbound_processor()
+            if proc is not None:
+                stats['inbound_processor'] = proc.get_metrics()
+        except Exception:
+            pass
+
+        try:
+            from apps.sms.outbound_processor import get_outbound_processor
+
+            out = get_outbound_processor()
+            if out is not None:
+                stats['outbound_processor'] = out.get_metrics()
+        except Exception:
+            pass
+
+        try:
+            from apps.external_device.mqtt_handler_queue import get_mqtt_handler_queue
+
+            mq = get_mqtt_handler_queue()
+            if mq is not None:
+                stats['mqtt_handler'] = mq.get_metrics()
+        except Exception:
+            pass
+
+        return Response(stats)

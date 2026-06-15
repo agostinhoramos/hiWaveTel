@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Global remote client instance (set by run_mqtt_gateway command)
 _global_remote_client = None
+_global_local_client = None
 
 # Device ID sanitization cache to avoid O(N) table scans on every MQTT message
 # Maps sanitized_id -> canonical device_id
@@ -90,11 +91,13 @@ def build_modem_status_mqtt_payload(modem_index: int) -> dict[str, Any]:
     from django.utils import timezone
 
     from apps.sms.mmcli_client import MMCLIClient, MmcliError
+    from apps.sms.mmcli_lock import mmcli_serial
 
     timeout = float(getattr(settings, 'MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC', 45.0))
     try:
-        mm = MMCLIClient(timeout_sec=timeout)
-        flat = mm.show_modem(modem_index)
+        with mmcli_serial():
+            mm = MMCLIClient(timeout_sec=timeout)
+            flat = mm.show_modem(modem_index)
         return {
             'modem_index': modem_index,
             'gathered_at': timezone.now().isoformat(),
@@ -341,6 +344,13 @@ class GatewayMqttClient:
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
 
+        self._reconnect_stop = threading.Event()
+        self._reconnect_delay_ms = int(getattr(settings, 'MQTT_RECONNECT_INITIAL_DELAY_MS', 1000))
+        self._reconnect_max_ms = int(getattr(settings, 'MQTT_RECONNECT_MAX_DELAY_MS', 30000))
+        self._reconnect_multiplier = float(getattr(settings, 'MQTT_RECONNECT_BACKOFF_MULTIPLIER', 2.0))
+        self._reconnect_jitter = float(getattr(settings, 'MQTT_RECONNECT_JITTER', 0.2))
+        self._watchdog_interval_ms = int(getattr(settings, 'MQTT_CONNECTION_WATCHDOG_INTERVAL_MS', 0))
+
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
 
@@ -363,6 +373,64 @@ class GatewayMqttClient:
         """Connect to MQTT broker."""
         _LOGGER.info('Connecting to MQTT broker %s:%d...', self.broker_url, self.port)
         self.client.connect(self.broker_url, self.port, self.keepalive)
+        self._reconnect_stop.clear()
+        if self._watchdog_interval_ms > 0:
+            threading.Thread(
+                target=self._connection_watchdog_runner,
+                daemon=True,
+                name='mqtt-local-watchdog',
+            ).start()
+
+    def publish_json(self, topic: str, payload: dict[str, Any]) -> bool:
+        """Publish JSON on the persistent client session."""
+        if not _paho_client_connected(self.client):
+            _LOGGER.warning('Persistent MQTT client disconnected; cannot publish topic=%s', topic)
+            return False
+        try:
+            message = json.dumps(payload)
+            info = self.client.publish(topic, message, qos=self.qos)
+            info.wait_for_publish(timeout=float(getattr(settings, 'MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC', 15.0)))
+            return bool(info.is_published())
+        except Exception:
+            _LOGGER.warning('Persistent MQTT publish failed topic=%s', topic, exc_info=True)
+            return False
+
+    def _connection_watchdog_runner(self) -> None:
+        interval = max(0.5, self._watchdog_interval_ms / 1000.0)
+        while not self._reconnect_stop.wait(interval):
+            if not _paho_client_connected(self.client):
+                self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if not getattr(settings, 'MQTT_AUTO_RECONNECT', True):
+            return
+        threading.Thread(target=self._reconnect_with_backoff, daemon=True, name='mqtt-local-reconnect').start()
+
+    def _reconnect_with_backoff(self) -> None:
+        import random
+
+        delay_ms = self._reconnect_delay_ms
+        max_retries = int(getattr(settings, 'MQTT_RECONNECT_MAX_RETRIES', 0))
+        attempt = 0
+        while not self._reconnect_stop.is_set():
+            if _paho_client_connected(self.client):
+                self._reconnect_delay_ms = int(getattr(settings, 'MQTT_RECONNECT_INITIAL_DELAY_MS', 1000))
+                return
+            attempt += 1
+            if max_retries > 0 and attempt > max_retries:
+                _LOGGER.error('MQTT reconnect max retries exceeded')
+                return
+            jitter = 1.0 + random.uniform(-self._reconnect_jitter, self._reconnect_jitter)
+            sleep_sec = max(0.1, (delay_ms / 1000.0) * jitter)
+            _LOGGER.warning('MQTT reconnect attempt %s in %.2fs', attempt, sleep_sec)
+            if self._reconnect_stop.wait(sleep_sec):
+                return
+            try:
+                self.client.reconnect()
+            except Exception as exc:
+                _LOGGER.warning('MQTT reconnect failed: %s', exc)
+            delay_ms = min(int(delay_ms * self._reconnect_multiplier), self._reconnect_max_ms)
+            self._reconnect_delay_ms = delay_ms
 
     def loop_forever(self) -> None:
         """Start MQTT client loop (blocking)."""
@@ -383,8 +451,26 @@ class GatewayMqttClient:
         """Disconnect from MQTT broker."""
         self._modem_push_stop.set()
         self._mqtt_ping_stop.set()
+        self._reconnect_stop.set()
         _LOGGER.info('Disconnecting from MQTT broker...')
         self.client.disconnect()
+
+    def _dispatch_mqtt_handler_sync(self, handler_key: str, topic: str, payload: dict[str, Any]) -> None:
+        if handler_key == 'modem_status_request':
+            if self.subscribe_modem_status:
+                self._schedule_modem_status_snapshot(topic)
+        elif handler_key == 'catalog_snapshot':
+            persist_modem_catalog_from_mqtt('snapshot', payload)
+        elif handler_key == 'catalog_contacts':
+            persist_modem_catalog_from_mqtt('contacts', payload)
+        elif handler_key == 'health_ping':
+            self._handle_health_ping(topic, payload)
+        elif handler_key == 'health_pong':
+            self._handle_health_pong(topic, payload)
+        elif handler_key == 'sms_status':
+            self._handle_status_message(topic, payload)
+        elif handler_key == 'sms_inbox':
+            self._handle_inbox_message(topic, payload)
 
     def publish_send_request(self, device_id: str, payload: dict[str, Any]) -> None:
         """Publish SMS send request to external device."""
@@ -619,6 +705,7 @@ class GatewayMqttClient:
             _LOGGER.info('Disconnected from MQTT broker gracefully')
         else:
             _LOGGER.warning('Disconnected from MQTT broker unexpectedly: rc=%d', rc)
+            self._schedule_reconnect()
 
     def _subscribe_to_topics(self) -> None:
         """Subscribe to wildcard topics for all devices and optional modem status."""
@@ -661,7 +748,7 @@ class GatewayMqttClient:
         _LOGGER.info('Subscribed to: %s', ', '.join(subs))
 
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: MQTTMessage) -> None:
-        """Callback when message received."""
+        """Callback when message received — enqueue only (fast path)."""
         topic = msg.topic
         payload_str = msg.payload.decode('utf-8')
 
@@ -678,41 +765,27 @@ class GatewayMqttClient:
                 _LOGGER.warning('Invalid JSON payload on %s: %s', topic, payload_str)
                 return
 
-        if topic.endswith('/status/request') and '/modems/' in topic:
-            if self.subscribe_modem_status:
-                self._schedule_modem_status_snapshot(topic)
-            return
+        from apps.external_device.mqtt_handler_queue import classify_mqtt_topic, get_mqtt_handler_queue
 
-        if self.subscribe_modem_catalog and topic.endswith('/modems/snapshot'):
-            try:
-                persist_modem_catalog_from_mqtt('snapshot', payload)
-            except Exception as exc:
-                _LOGGER.exception('Error persisting modem snapshot catalog: %s', exc)
-            return
-
-        if self.subscribe_modem_catalog and topic.endswith('/modems/contacts'):
-            try:
-                persist_modem_catalog_from_mqtt('contacts', payload)
-            except Exception as exc:
-                _LOGGER.exception('Error persisting modem contacts catalog: %s', exc)
-            return
-
-        if topic.endswith('/health/ping'):
-            if self.subscribe_health_ping:
-                self._handle_health_ping(topic, payload)
-            return
-
-        if topic.endswith('/health/pong'):
-            if self.subscribe_health_pong:
-                self._handle_health_pong(topic, payload)
-            return
-
-        if topic.endswith('/sms/status'):
-            self._handle_status_message(topic, payload)
-        elif topic.endswith('/sms/inbox'):
-            self._handle_inbox_message(topic, payload)
-        else:
+        handler_key, rank = classify_mqtt_topic(topic)
+        if handler_key is None:
             _LOGGER.warning('Unknown topic pattern: %s', topic)
+            return
+        if handler_key.startswith('catalog_') and not self.subscribe_modem_catalog:
+            return
+        if handler_key == 'health_ping' and not self.subscribe_health_ping:
+            return
+        if handler_key == 'health_pong' and not self.subscribe_health_pong:
+            return
+        if handler_key == 'modem_status_request' and not self.subscribe_modem_status:
+            return
+
+        mq = get_mqtt_handler_queue()
+        if mq is not None:
+            mq.enqueue(handler_key, topic, payload, client_ref=self, rank=rank)
+            return
+
+        self._dispatch_mqtt_handler_sync(handler_key, topic, payload)
 
     def _schedule_modem_status_snapshot(self, request_topic: str) -> None:
         """Run ``mmcli`` off the MQTT thread and publish ``.../status/response``."""
@@ -1014,7 +1087,14 @@ class GatewayMqttClient:
             elif HiDishelinkDevice.objects.filter(pk=candidate).exists():
                 result = candidate
 
-        # Slow path: iterate all devices (TODO: add sanitized_device_id field to models)
+        if result is None:
+            found = ExternalDevice.objects.filter(sanitized_device_id=sanitized_id).values_list(
+                'device_id', flat=True
+            ).first()
+            if found:
+                result = found
+
+        # Slow path: iterate all devices (legacy rows without sanitized_device_id)
         if result is None:
             for device in ExternalDevice.objects.all():
                 if sanitize_device_id(device.device_id) == sanitized_id:
@@ -1107,7 +1187,7 @@ def publish_send_request_ephemeral(device_id: str, payload: dict[str, Any]) -> b
 
 
 def publish_modem_inbox_delivery_ephemeral(device_id: str, payload: dict[str, Any]) -> bool:
-    """Publish modem-mirrored inbox row to `{device_topic_prefix}/.../sms/inbox_delivery` (gateway → subscribers)."""
+    """Publish modem-mirrored inbox row to `{device_topic_prefix}/.../sms/inbox_delivery`."""
     sanitized = sanitize_device_id(device_id)
     topic = f'{resolved_mqtt_device_topic_prefix()}/{sanitized}/sms/inbox_delivery'
     return _publish_json_ephemeral(topic, payload)
@@ -1238,6 +1318,12 @@ class RemoteHiDishelinkClient:
         self._chunk_buffer: dict[str, dict[str, Any]] = {}
         self._chunk_lock = threading.Lock()
         self._chunk_ttl_sec = 300  # 5 minutes
+
+        self._reconnect_stop = threading.Event()
+        self._reconnect_delay_ms = int(getattr(settings, 'MQTT_RECONNECT_INITIAL_DELAY_MS', 1000))
+        self._reconnect_max_ms = int(getattr(settings, 'MQTT_RECONNECT_MAX_DELAY_MS', 30000))
+        self._reconnect_multiplier = float(getattr(settings, 'MQTT_RECONNECT_BACKOFF_MULTIPLIER', 2.0))
+        self._reconnect_jitter = float(getattr(settings, 'MQTT_RECONNECT_JITTER', 0.2))
         
         # Create Paho client
         self.client = mqtt.Client(
@@ -1282,6 +1368,40 @@ class RemoteHiDishelinkClient:
             self.device_id,
         )
         self.client.connect(self.broker_url, self.port, self.keepalive)
+        self._reconnect_stop.clear()
+
+    def _schedule_remote_reconnect(self) -> None:
+        if not getattr(settings, 'MQTT_AUTO_RECONNECT', True):
+            return
+        threading.Thread(
+            target=self._remote_reconnect_with_backoff,
+            daemon=True,
+            name=f'mqtt-remote-reconnect-{self.sanitized_device_id}',
+        ).start()
+
+    def _remote_reconnect_with_backoff(self) -> None:
+        import random
+
+        delay_ms = self._reconnect_delay_ms
+        max_retries = int(getattr(settings, 'MQTT_RECONNECT_MAX_RETRIES', 0))
+        attempt = 0
+        while not self._reconnect_stop.is_set():
+            if _paho_client_connected(self.client):
+                self._reconnect_delay_ms = int(getattr(settings, 'MQTT_RECONNECT_INITIAL_DELAY_MS', 1000))
+                return
+            attempt += 1
+            if max_retries > 0 and attempt > max_retries:
+                return
+            jitter = 1.0 + random.uniform(-self._reconnect_jitter, self._reconnect_jitter)
+            sleep_sec = max(0.1, (delay_ms / 1000.0) * jitter)
+            if self._reconnect_stop.wait(sleep_sec):
+                return
+            try:
+                self.client.reconnect()
+            except Exception as exc:
+                _LOGGER.warning('Remote MQTT reconnect failed device=%s: %s', self.device_id, exc)
+            delay_ms = min(int(delay_ms * self._reconnect_multiplier), self._reconnect_max_ms)
+            self._reconnect_delay_ms = delay_ms
     
     def loop_forever(self) -> None:
         """Start MQTT client loop (blocking)."""
@@ -1301,6 +1421,7 @@ class RemoteHiDishelinkClient:
     def disconnect(self) -> None:
         """Disconnect from remote broker."""
         self._heartbeat_stop.set()
+        self._reconnect_stop.set()
         _LOGGER.info('RemoteHiDishelinkClient disconnecting device=%s', self.device_id)
         self.client.disconnect()
     
@@ -1352,6 +1473,7 @@ class RemoteHiDishelinkClient:
                 rc,
                 self.device_id,
             )
+            self._schedule_remote_reconnect()
     
     def _subscribe_to_topics(self) -> None:
         """Subscribe to remote hiDisheLink topics."""

@@ -62,6 +62,15 @@ class SmsConfig(AppConfig):
                         inbound_obj.pk,
                     )
 
+            from apps.sms.outbound_processor import queues_enabled_in_process
+
+            if not queues_enabled_in_process():
+                from apps.external_device.services import sync_single_inbound_to_all_devices
+
+                sync_single_inbound_to_all_devices(instance)
+                _publish_remote_fallback(instance)
+                return
+
             def enqueue_processing():
                 processor = get_inbound_processor()
                 if processor is not None:
@@ -83,10 +92,11 @@ class SmsConfig(AppConfig):
 
             transaction.on_commit(enqueue_processing)
 
-        # Start inbound processor eagerly in long-running processes (watcher / gateway / gunicorn).
+        # Start inbound/outbound processors only in daemon processes (watcher / mqtt gateway).
         import os
 
-        if int(os.environ.get('INBOUND_PROCESSOR_WORKERS', '2')) > 0:
+        queues_enabled = os.environ.get('HIWAVETEL_QUEUE_ENABLED', '').lower() == 'true'
+        if queues_enabled and int(os.environ.get('INBOUND_PROCESSOR_WORKERS', '2')) > 0:
             try:
                 from .inbound_processor import get_inbound_processor
 
@@ -96,6 +106,29 @@ class SmsConfig(AppConfig):
 
                 logging.getLogger(__name__).exception(
                     'Failed to start inbound processor queue at app ready',
+                )
+
+        if queues_enabled:
+            try:
+                from .outbound_processor import get_outbound_processor
+
+                get_outbound_processor()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    'Failed to start outbound processor queue at app ready',
+                )
+
+            try:
+                from apps.external_device.mqtt_handler_queue import get_mqtt_handler_queue
+
+                get_mqtt_handler_queue()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    'Failed to start MQTT handler queue at app ready',
                 )
         
         # Register shutdown handlers for queues
@@ -119,5 +152,22 @@ class SmsConfig(AppConfig):
                     p.stop(timeout=10.0)
                 except Exception:
                     pass
+
+            from . import outbound_processor as _op
+            o = _op._global_outbound
+            if o is not None:
+                try:
+                    o.stop(timeout=10.0)
+                except Exception:
+                    pass
+
+            try:
+                from apps.external_device import mqtt_handler_queue as _mh
+
+                h = _mh._global_handler
+                if h is not None:
+                    h.stop(timeout=10.0)
+            except Exception:
+                pass
         
         atexit.register(shutdown_queues)

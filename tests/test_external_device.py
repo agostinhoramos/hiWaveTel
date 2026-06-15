@@ -687,7 +687,7 @@ class TestServices:
         assert len(hashed) == 64
         assert all(c in '0123456789abcdef' for c in hashed)
 
-    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
+    @patch('apps.external_device.mqtt_publish.publish_send_request')
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
     def test_process_sms_request(self, mock_dispatch, mock_mqtt_publish, active_device):
         """Process SMS request creates request and dispatches to modem."""
@@ -721,7 +721,7 @@ class TestServices:
         assert 'timestamp' in payload
 
     @override_settings(MQTT_PUBLISH_SEND_REQUEST=True, MQTT_SEND_RECIPIENTS_CHUNK_SIZE=2)
-    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
+    @patch('apps.external_device.mqtt_publish.publish_send_request')
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
     def test_process_sms_request_chunks_mqtt_recipients(self, mock_dispatch, mock_mqtt_publish, active_device):
         def mock_dispatch_impl(outbound):
@@ -758,7 +758,7 @@ class TestServices:
         assert ts_re.match(payload2['timestamp']), f"unexpected timestamp: {payload2.get('timestamp')}"
 
     @override_settings(MQTT_PUBLISH_SEND_REQUEST=False)
-    @patch('apps.external_device.mqtt_client.publish_send_request_ephemeral')
+    @patch('apps.external_device.mqtt_publish.publish_send_request')
     @patch('apps.external_device.services.dispatch_outbound_mmcli')
     def test_process_sms_request_skips_mqtt_when_disabled(
         self,

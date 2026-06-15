@@ -251,6 +251,9 @@ class Command(BaseCommand):
         # Create and start local client
         client = LocalGatewayClient(mqtt_config=mqtt_cfg)
         client.connect()
+
+        import apps.external_device.mqtt_client as mqtt_mod
+        mqtt_mod._global_local_client = client
         
         def local_loop():
             try:
@@ -258,6 +261,7 @@ class Command(BaseCommand):
             except KeyboardInterrupt:
                 self.stdout.write(self.style.WARNING('Local gateway shutting down...'))
                 client.disconnect()
+                mqtt_mod._global_local_client = None
         
         thread = threading.Thread(target=local_loop, daemon=False, name='mqtt-local-gateway')
         thread.start()

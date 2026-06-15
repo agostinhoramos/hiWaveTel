@@ -113,6 +113,19 @@ async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
                 refresh_stale_inbound_sms_rows,
                 modem_index,
             )
+
+            def _sync_device_inboxes() -> None:
+                from apps.external_device.models import ExternalDevice
+                from apps.external_device.services import sync_inbox_from_modem_store
+
+                for device in ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE):
+                    try:
+                        sync_inbox_from_modem_store(device)
+                    except Exception:
+                        _LOGGER.exception('Background inbox sync failed device=%s', device.device_id)
+
+            await loop.run_in_executor(None, _sync_device_inboxes)
+
             metrics.increment('periodic_recovery_runs')
             _LOGGER.info(
                 'Periodic recovery: synced %s SMS paths, stale refresh %s (modem_index=%s)',

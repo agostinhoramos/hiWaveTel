@@ -175,6 +175,103 @@ def register_device(data: dict[str, Any]) -> tuple[ExternalDevice, str]:
     return (device, raw_api_key)
 
 
+def _dispatch_sms_request_sync(sms_request: SmsRequest) -> None:
+    """Run mmcli dispatch for all recipients on an existing SmsRequest (sync worker path)."""
+    recipients = list(sms_request.recipients or [])
+    message = sms_request.message
+    device = sms_request.device
+    modem_ix = modem_index_for_external_device(device)
+    sent_count = 0
+    failed_count = 0
+
+    for recipient in recipients:
+        recipient = str(recipient).strip()
+        try:
+            outbound = OutboundSms.objects.create(
+                modem_index=modem_ix,
+                to_number=recipient,
+                text=message,
+                state=OutboundSms.State.CREATED,
+            )
+            dispatch_outbound_mmcli(outbound)
+
+            if outbound.state == OutboundSms.State.SENT:
+                status = SmsRecipientStatus.Status.SENT
+                sent_count += 1
+            else:
+                status = SmsRecipientStatus.Status.FAILED
+                failed_count += 1
+
+            SmsRecipientStatus.objects.update_or_create(
+                request=sms_request,
+                phone_number=recipient,
+                defaults={
+                    'status': status,
+                    'message_id': outbound.mm_path or '',
+                    'error_message': outbound.error_message or '',
+                },
+            )
+        except Exception as exc:
+            _LOGGER.warning('Failed to send SMS to %s: %s', recipient, exc)
+            failed_count += 1
+            SmsRecipientStatus.objects.update_or_create(
+                request=sms_request,
+                phone_number=recipient,
+                defaults={
+                    'status': SmsRecipientStatus.Status.FAILED,
+                    'error_message': str(exc)[:500],
+                },
+            )
+
+    sms_request.sent_count = sent_count
+    sms_request.failed_count = failed_count
+    if sent_count == len(recipients):
+        sms_request.status = SmsRequest.Status.COMPLETED
+    elif sent_count > 0:
+        sms_request.status = SmsRequest.Status.PARTIAL
+    else:
+        sms_request.status = SmsRequest.Status.FAILED
+    sms_request.save(update_fields=['sent_count', 'failed_count', 'status', 'updated_at'])
+    _LOGGER.info(
+        'SMS request %s dispatched: %d sent, %d failed',
+        sms_request.request_id,
+        sent_count,
+        failed_count,
+    )
+
+
+def _publish_sms_request_mqtt(device: ExternalDevice, request_id: str, recipients: list[str], message: str, priority: str) -> None:
+    if not getattr(settings, 'MQTT_PUBLISH_SEND_REQUEST', False):
+        return
+    chunk_sz = max(1, int(getattr(settings, 'MQTT_SEND_RECIPIENTS_CHUNK_SIZE', 50)))
+    recips = list(recipients)
+    total_chunks = max(1, (len(recips) + chunk_sz - 1) // chunk_sz)
+    try:
+        from apps.external_device.mqtt_publish import publish_send_request
+
+        for i in range(0, len(recips), chunk_sz):
+            chunk = recips[i : i + chunk_sz]
+            chunk_index = i // chunk_sz
+            mqtt_payload: dict[str, Any] = {
+                'request_id': request_id,
+                'recipients': chunk,
+                'message': message,
+                'priority': priority,
+                'timestamp': timezone.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            }
+            if total_chunks > 1:
+                mqtt_payload['chunk_index'] = chunk_index
+                mqtt_payload['chunk_total'] = total_chunks
+            publish_send_request(device.device_id, mqtt_payload)
+    except Exception:
+        _LOGGER.warning(
+            'MQTT publish_send_request failed for request_id=%s device=%s',
+            request_id,
+            device.device_id,
+            exc_info=True,
+        )
+
+
 def process_sms_request(
     device: ExternalDevice,
     recipients: list[str],
@@ -206,6 +303,30 @@ def process_sms_request(
         raise ValidationError({'message': 'Message cannot be empty.'})
 
     request_id = f'sms_{secrets.token_urlsafe(8)}'
+
+    from apps.sms.outbound_processor import enqueue_outbound_job, outbound_async_enabled
+
+    if outbound_async_enabled():
+        with transaction.atomic():
+            sms_request = SmsRequest.objects.create(
+                request_id=request_id,
+                device=device,
+                recipients=recipients,
+                message=message,
+                priority=priority,
+                status=SmsRequest.Status.QUEUED,
+            )
+            for recipient in recipients:
+                SmsRecipientStatus.objects.create(
+                    request=sms_request,
+                    phone_number=str(recipient).strip(),
+                    status=SmsRecipientStatus.Status.PENDING,
+                )
+
+        enqueue_outbound_job('sms_request', request_id, priority=priority)
+        _publish_sms_request_mqtt(device, request_id, recipients, message, priority)
+        _LOGGER.info('SMS request %s queued (async)', request_id)
+        return sms_request
 
     with transaction.atomic():
         sms_request = SmsRequest.objects.create(
@@ -269,34 +390,7 @@ def process_sms_request(
 
     _LOGGER.info('SMS request %s processed: %d sent, %d failed', request_id, sent_count, failed_count)
 
-    if getattr(settings, 'MQTT_PUBLISH_SEND_REQUEST', False):
-        chunk_sz = max(1, int(getattr(settings, 'MQTT_SEND_RECIPIENTS_CHUNK_SIZE', 50)))
-        recips = list(recipients)
-        total_chunks = max(1, (len(recips) + chunk_sz - 1) // chunk_sz)
-        try:
-            from apps.external_device.mqtt_client import publish_send_request_ephemeral
-
-            for i in range(0, len(recips), chunk_sz):
-                chunk = recips[i : i + chunk_sz]
-                chunk_index = i // chunk_sz  # 0-based per hiDisheLink spec §7.3
-                mqtt_payload: dict[str, Any] = {
-                    'request_id': request_id,
-                    'recipients': chunk,
-                    'message': message,
-                    'priority': priority,
-                    'timestamp': timezone.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                }
-                if total_chunks > 1:
-                    mqtt_payload['chunk_index'] = chunk_index
-                    mqtt_payload['chunk_total'] = total_chunks
-                publish_send_request_ephemeral(device.device_id, mqtt_payload)
-        except Exception:
-            _LOGGER.warning(
-                'MQTT publish_send_request_ephemeral failed for request_id=%s device=%s',
-                request_id,
-                device.device_id,
-                exc_info=True,
-            )
+    _publish_sms_request_mqtt(device, request_id, recipients, message, priority)
 
     return sms_request
 
@@ -487,39 +581,47 @@ def sync_inbox_from_modem_store(device: ExternalDevice) -> None:
         )
 
     total_inbound = qs.count()
-    inbound_rows = qs.order_by('-created_at')[:500]
+    inbound_rows = list(qs.order_by('-created_at')[:500])
+    existing_ids = set(
+        InboxMessage.objects.filter(device=device).values_list('message_id', flat=True)
+    )
     created_count = 0
     existing_count = 0
     patched_count = 0
+    to_create: list[InboxMessage] = []
 
     for inbound in inbound_rows:
-        # Include device.pk in message_id to support multiple devices (message_id is unique=True)
         message_id = f'mmcli_{inbound.pk}_dev_{device.pk}'
-        inbox_msg, created = InboxMessage.objects.get_or_create(
-            message_id=message_id,
-            defaults={
-                'device': device,
-                'sender': inbound.from_number,
-                'body': inbound.text,
-                'received_at': inbound.created_at,
-                # No MQTT ACK exists for mirrored modem rows.
-                'ack_sent': True,
-            },
-        )
-        if created:
-            created_count += 1
-        else:
+        if message_id in existing_ids:
             existing_count += 1
-            patched: dict[str, str] = {}
-            if not inbox_msg.sender and inbound.from_number:
-                patched['sender'] = inbound.from_number
-            if not inbox_msg.body and inbound.text:
-                patched['body'] = inbound.text
-            if patched:
-                for key, val in patched.items():
-                    setattr(inbox_msg, key, val)
-                inbox_msg.save(update_fields=list(patched.keys()))
-                patched_count += 1
+            inbox_msg = InboxMessage.objects.filter(message_id=message_id).first()
+            if inbox_msg:
+                patched: dict[str, str] = {}
+                if not inbox_msg.sender and inbound.from_number:
+                    patched['sender'] = inbound.from_number
+                if not inbox_msg.body and inbound.text:
+                    patched['body'] = inbound.text
+                if patched:
+                    for key, val in patched.items():
+                        setattr(inbox_msg, key, val)
+                    inbox_msg.save(update_fields=list(patched.keys()))
+                    patched_count += 1
+            continue
+        to_create.append(
+            InboxMessage(
+                message_id=message_id,
+                device=device,
+                sender=inbound.from_number,
+                body=inbound.text,
+                received_at=inbound.created_at,
+                ack_sent=True,
+            )
+        )
+        existing_ids.add(message_id)
+
+    if to_create:
+        InboxMessage.objects.bulk_create(to_create, ignore_conflicts=True)
+        created_count = len(to_create)
 
     if total_inbound == 0:
         available_modem_indexes = sorted(
@@ -920,6 +1022,81 @@ def delete_external_device_and_dependencies(device: ExternalDevice) -> dict[str,
 # Remote hiDisheLink bridge handlers (section 10 of hiDisheLink architecture doc)
 
 
+def _dispatch_remote_sms_sync(remote_client, request_id: str, payload: dict[str, Any]) -> None:
+    """Dispatch remote SMS send via mmcli and publish final MQTT status."""
+    recipients = payload.get('recipients') or []
+    message = str(payload.get('message', '')).strip()
+    details = []
+    sent_count = 0
+    failed_count = 0
+
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+
+    modem_idx = resolve_modem_mmcli_index(int(getattr(settings, 'MODEM_MMCLI_INDEX', 0)))
+
+    for recipient in recipients:
+        recipient_num = str(recipient).strip()
+        if not recipient_num:
+            details.append({
+                'recipient': recipient_num,
+                'status': 'failed',
+                'error': 'Empty recipient number',
+            })
+            failed_count += 1
+            continue
+        try:
+            outbound = OutboundSms.objects.create(
+                modem_index=modem_idx,
+                to_number=recipient_num,
+                text=message,
+                state=OutboundSms.State.CREATED,
+            )
+            dispatch_outbound_mmcli(outbound)
+            outbound.refresh_from_db()
+            if outbound.state == OutboundSms.State.SENT:
+                details.append({
+                    'recipient': recipient_num,
+                    'status': 'sent',
+                    'message_id': outbound.mm_path or f'outbound_{outbound.pk}',
+                })
+                sent_count += 1
+            else:
+                details.append({
+                    'recipient': recipient_num,
+                    'status': 'failed',
+                    'error': outbound.error_message or 'Unknown error',
+                })
+                failed_count += 1
+        except Exception as exc:
+            _LOGGER.exception('Remote SMS dispatch failed recipient=%s request_id=%s', recipient_num, request_id)
+            details.append({
+                'recipient': recipient_num,
+                'status': 'failed',
+                'error': str(exc)[:200],
+            })
+            failed_count += 1
+
+    if failed_count == 0:
+        final_status = 'success'
+    elif sent_count == 0:
+        final_status = 'error'
+    else:
+        final_status = 'partial'
+
+    remote_client.publish_sms_status(
+        request_id,
+        final_status,
+        {'sent': sent_count, 'failed': failed_count, 'details': details},
+    )
+    _LOGGER.info(
+        'Remote SMS send completed request_id=%s status=%s sent=%s failed=%s',
+        request_id,
+        final_status,
+        sent_count,
+        failed_count,
+    )
+
+
 def handle_remote_sms_send(remote_client, payload: dict[str, Any]) -> None:
     """Handle SMS send request from remote hiDisheLink broker (section 10 handler).
     
@@ -997,90 +1174,20 @@ def handle_remote_sms_send(remote_client, payload: dict[str, Any]) -> None:
         # TODO: Implement buffering and aggregation (to-do #4: chunking-aggregation)
         # For now, process each chunk immediately
     
-    # Step 4: Dispatch via mmcli para cada recipient
-    details = []
-    sent_count = 0
-    failed_count = 0
-    
-    # Determine modem index (use default from settings)
-    from apps.sms.mmcli_client import resolve_modem_mmcli_index
-    modem_idx = resolve_modem_mmcli_index(int(getattr(settings, 'MODEM_MMCLI_INDEX', 0)))
-    
-    for recipient in recipients:
-        recipient_num = str(recipient).strip()
-        if not recipient_num:
-            details.append({
-                'recipient': recipient_num,
-                'status': 'failed',
-                'error': 'Empty recipient number',
-            })
-            failed_count += 1
-            continue
-        
-        try:
-            # Create OutboundSms
-            outbound = OutboundSms.objects.create(
-                modem_index=modem_idx,
-                to_number=recipient_num,
-                text=message,
-                state=OutboundSms.State.CREATED,
-            )
-            
-            # Dispatch via mmcli
-            dispatch_outbound_mmcli(outbound)
-            
-            # Reload to get updated state
-            outbound.refresh_from_db()
-            
-            if outbound.state == OutboundSms.State.SENT:
-                details.append({
-                    'recipient': recipient_num,
-                    'status': 'sent',
-                    'message_id': outbound.mm_path or f'outbound_{outbound.pk}',
-                })
-                sent_count += 1
-            else:
-                details.append({
-                    'recipient': recipient_num,
-                    'status': 'failed',
-                    'error': outbound.error_message or 'Unknown error',
-                })
-                failed_count += 1
-        
-        except Exception as exc:
-            _LOGGER.exception('Remote SMS dispatch failed recipient=%s request_id=%s', recipient_num, request_id)
-            details.append({
-                'recipient': recipient_num,
-                'status': 'failed',
-                'error': str(exc)[:200],
-            })
-            failed_count += 1
-    
-    # Step 5: Publicar status final
-    if failed_count == 0:
-        final_status = 'success'
-    elif sent_count == 0:
-        final_status = 'error'
-    else:
-        final_status = 'partial'
-    
-    remote_client.publish_sms_status(
-        request_id,
-        final_status,
-        {
-            'sent': sent_count,
-            'failed': failed_count,
-            'details': details,
-        },
-    )
-    
-    _LOGGER.info(
-        'Remote SMS send completed request_id=%s status=%s sent=%s failed=%s',
-        request_id,
-        final_status,
-        sent_count,
-        failed_count,
-    )
+    job_payload = {
+        'recipients': recipients,
+        'message': message,
+        'priority': payload.get('priority', 'normal'),
+    }
+    priority = str(payload.get('priority', 'normal'))
+
+    from apps.sms.outbound_processor import enqueue_outbound_job, outbound_async_enabled
+
+    if outbound_async_enabled():
+        enqueue_outbound_job('remote', request_id, priority=priority, payload=job_payload)
+        return
+
+    _dispatch_remote_sms_sync(remote_client, request_id, job_payload)
 
 
 def publish_inbound_to_remote(inbound, remote_client) -> bool:

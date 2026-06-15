@@ -627,3 +627,27 @@ print(processor.get_metrics())  # {'processed': N, 'failed': M, 'retries': R, 'q
 
 **Impacto incremental:** Estas otimizações adicionais podem trazer melhorias de 2-3x extra, mas o sistema atual já é 50-100x mais rápido que a baseline.
 
+---
+
+## 16. Performance Outbound / MQTT Edge (implementado)
+
+### 16.1 OutboundProcessorQueue
+
+- Fila prioritária (`urgent` > `high` > `normal`) com worker serial ao modem
+- Activar: `OUTBOUND_ASYNC_ENABLED=true` + `HIWAVETEL_QUEUE_ENABLED=true` nos daemons
+- API Gunicorn enfileira via `SmsDispatchOutbox` (cross-process)
+
+### 16.2 MQTT handler offload
+
+- `_on_message` apenas classifica topic e enfileira (`MqttHandlerQueue`)
+- Load-shedding de health/catalog quando `queue_size > MQTT_HANDLER_LOAD_SHED_THRESHOLD`
+
+### 16.3 Publicação MQTT persistente
+
+- `mqtt_publish.publish_json` usa cliente persistente ou outbox SQLite
+- Fallback ephemeral mantido para compatibilidade
+
+### 16.4 Variáveis novas
+
+Ver `.env.example`: `OUTBOUND_*`, `MQTT_HANDLER_*`, `HIWAVETEL_QUEUE_ENABLED`, `MQTT_PERSISTENT_PUBLISH`.
+

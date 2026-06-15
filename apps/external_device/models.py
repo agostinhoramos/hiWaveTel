@@ -22,6 +22,13 @@ class ExternalDevice(models.Model):
         SUSPENDED = 'suspended', 'Suspended'
 
     device_id = models.CharField(max_length=64, primary_key=True, help_text='Unique device identifier (e.g. phone number)')
+    sanitized_device_id = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        blank=True,
+        help_text='MQTT topic-safe device id (derived from device_id)',
+    )
     name = models.CharField(max_length=255, help_text='Human-readable device name')
     device_type = models.CharField(max_length=64, default='modem', help_text='Device type (modem, gateway, etc.)')
     api_key_hash = models.CharField(max_length=64, blank=True, help_text='SHA-256 hash of API key')
@@ -45,6 +52,12 @@ class ExternalDevice(models.Model):
 
     def __str__(self) -> str:
         return f'{self.device_id} ({self.status})'
+
+    def save(self, *args, **kwargs):
+        from apps.external_device.mqtt_client import sanitize_device_id
+
+        self.sanitized_device_id = sanitize_device_id(self.device_id)
+        super().save(*args, **kwargs)
 
     def mark_seen(self) -> None:
         """Update last_seen and mark available."""
@@ -150,6 +163,7 @@ class SmsRecipientStatus(models.Model):
     """Per-recipient status for an SMS request."""
 
     class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
         SENT = 'sent', 'Sent'
         FAILED = 'failed', 'Failed'
 
@@ -251,6 +265,44 @@ class HiDishelinkDevice(models.Model):
 
     def __str__(self) -> str:
         return f'{self.device_id} ({self.status})'
+
+
+class SmsDispatchOutbox(models.Model):
+    """Cross-process outbound job queue (API process inserts, daemon drains)."""
+
+    class JobType(models.TextChoices):
+        SMS_REQUEST = 'sms_request', 'SMS request'
+        OUTBOUND = 'outbound', 'Outbound SMS pk'
+        REMOTE = 'remote', 'Remote hiDisheLink send'
+
+    job_type = models.CharField(max_length=32, choices=JobType.choices, db_index=True)
+    reference = models.CharField(max_length=64, db_index=True)
+    priority = models.CharField(max_length=16, default='normal')
+    payload_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['dispatched_at', 'created_at']),
+        ]
+
+
+class MqttPublishOutbox(models.Model):
+    """Cross-process MQTT publish intent (Gunicorn inserts, mqtt gateway drains)."""
+
+    topic = models.CharField(max_length=512, db_index=True)
+    payload_json = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    published_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    retry_count = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['published_at', 'created_at']),
+        ]
 
 
 class MqttGatewayCatalogEntry(models.Model):
