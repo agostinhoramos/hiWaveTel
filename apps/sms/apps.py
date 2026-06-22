@@ -7,14 +7,16 @@ class SmsConfig(AppConfig):
 
     def ready(self) -> None:
         """Register signal handlers when app is ready."""
+        import os
+
         from django.db.models.signals import post_save
         from django.dispatch import receiver
 
         from .models import InboundSms
 
         @receiver(post_save, sender=InboundSms)
-        def deliver_inbound_via_webhook(sender, instance, created, **kwargs):
-            """Enqueue HTTP webhook delivery when inbound SMS is ready."""
+        def schedule_inbound_webhook_on_save(sender, instance, created, **kwargs):
+            """Persist webhook work to DB queue when inbound SMS is ready."""
             import logging
 
             from django.db import transaction
@@ -22,8 +24,7 @@ class SmsConfig(AppConfig):
                 inbound_ready_for_webhook,
                 inbound_should_skip_webhook,
             )
-            from apps.sms.inbound_processor import get_inbound_processor
-            from apps.sms.webhook_delivery import deliver_inbound_webhooks
+            from apps.sms.webhook_outbox import schedule_inbound_webhook
 
             logger = logging.getLogger(__name__)
 
@@ -39,46 +40,31 @@ class SmsConfig(AppConfig):
                     if not (patched & {'text', 'from_number', 'mm_state'}):
                         return
 
-            from apps.sms.outbound_processor import queues_enabled_in_process
-
-            if not queues_enabled_in_process():
+            def enqueue_to_outbox():
                 try:
-                    deliver_inbound_webhooks(instance)
+                    schedule_inbound_webhook(instance)
                 except Exception:
-                    logger.exception('Sync webhook delivery failed pk=%s', instance.pk)
-                return
+                    logger.exception('Failed to queue webhook job inbound pk=%s', instance.pk)
 
-            def enqueue_processing():
-                processor = get_inbound_processor()
-                if processor is not None:
-                    success = processor.enqueue(instance.pk)
-                    if not success:
-                        logger.error(
-                            'Inbound processor queue full pk=%s, falling back to sync webhook',
-                            instance.pk,
-                        )
-                        deliver_inbound_webhooks(instance)
-                else:
-                    deliver_inbound_webhooks(instance)
+            transaction.on_commit(enqueue_to_outbox)
 
-            transaction.on_commit(enqueue_processing)
-
-        import os
-
+        role = os.environ.get('HIWAVETEL_ROLE', '').strip().lower()
         queues_enabled = os.environ.get('HIWAVETEL_QUEUE_ENABLED', '').lower() == 'true'
-        if queues_enabled and int(os.environ.get('INBOUND_PROCESSOR_WORKERS', '2')) > 0:
-            try:
-                from .inbound_processor import get_inbound_processor
 
-                get_inbound_processor()
+        # Detection worker: start persist queue eagerly; no in-memory webhook processor.
+        if role in {'watcher', 'detector'} and queues_enabled:
+            try:
+                from .queue_processor import get_sms_queue
+
+                get_sms_queue()
             except Exception:
                 import logging
 
                 logging.getLogger(__name__).exception(
-                    'Failed to start inbound processor queue at app ready',
+                    'Failed to start SMS persist queue at app ready',
                 )
 
-        if queues_enabled:
+        if queues_enabled and role not in {'watcher', 'detector', 'webhook'}:
             try:
                 from .outbound_processor import get_outbound_processor
 
@@ -91,7 +77,6 @@ class SmsConfig(AppConfig):
                 )
 
         import atexit
-        from . import inbound_processor as _ip
         from . import outbound_processor as _op
         from . import queue_processor as _qp
 
@@ -100,12 +85,6 @@ class SmsConfig(AppConfig):
             if q is not None:
                 try:
                     q.stop(timeout=10.0)
-                except Exception:
-                    pass
-            p = _ip._global_processor
-            if p is not None:
-                try:
-                    p.stop(timeout=10.0)
                 except Exception:
                     pass
             o = _op._global_outbound

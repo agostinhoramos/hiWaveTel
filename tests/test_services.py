@@ -158,17 +158,14 @@ def test_post_save_requeues_webhook_when_text_patched():
             'state': 'received',
         },
     )
-    with patch.dict('os.environ', {'INBOUND_PROCESSOR_WORKERS': '0'}):
-        import apps.sms.inbound_processor as ip
+    with patch('django.db.transaction.on_commit', side_effect=lambda fn: fn()):
+        persist_inbound_sms(path, 0, client)
+    from apps.sms.models import WebhookDeliveryJob
 
-        ip._global_processor = None
-        with patch(
-            'apps.sms.webhook_delivery.deliver_inbound_webhooks',
-            return_value=True,
-        ) as mock_deliver:
-            with patch('django.db.transaction.on_commit', side_effect=lambda fn: fn()):
-                persist_inbound_sms(path, 0, client)
-        mock_deliver.assert_called()
+    assert WebhookDeliveryJob.objects.filter(
+        inbound_sms__mm_path=path,
+        status=WebhookDeliveryJob.Status.PENDING,
+    ).exists()
 
 
 def test_dispatch_success_updates_state():
@@ -182,9 +179,12 @@ def test_dispatch_success_updates_state():
     dummy.ensure_modem_index = MagicMock(return_value=None)
     dummy.create_sms = MagicMock(return_value='/org/freedesktop/ModemManager1/SMS/3')
     dummy.send_sms = MagicMock(return_value=None)
-    updated = dispatch_outbound_mmcli(outbound, client=dummy)
+    with patch('apps.sms.webhook_outbox.schedule_outbound_webhook') as mock_wh:
+        with patch('django.db.transaction.on_commit', side_effect=lambda fn: fn()):
+            updated = dispatch_outbound_mmcli(outbound, client=dummy)
     assert updated.state == OutboundSms.State.SENT
     assert updated.mm_path == '/org/freedesktop/ModemManager1/SMS/3'
+    mock_wh.assert_called_once()
 
 
 def test_dispatch_send_failure_marks_failed():

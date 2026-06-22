@@ -79,10 +79,14 @@ def sync_modem_sms_snapshot(modem_index: int, client: MMCLIClient | None = None)
             time.sleep(backoff * (2**attempt))
 
     n = 0
+    sms_queue = get_sms_queue()
     for path in paths:
         try:
-            persist_inbound_sms(path, modem_index, mm)
-            n += 1
+            if sms_queue.enqueue(path, modem_index):
+                n += 1
+            else:
+                _LOGGER.error('Persist queue full during snapshot: %s', path)
+                enqueue_persist_failure(path, modem_index, 'persist queue full (snapshot)')
         except IntegrityError:
             _LOGGER.warning('Integrity error persisting inbound %s — skipping.', path)
         except DatabaseError as exc:
@@ -176,10 +180,10 @@ def _make_on_added_callback(modem_index: int):
                 _LOGGER.info('SMS enqueued: sms_path=%s modem_index=%s', sms_path, modem_index)
             else:
                 _LOGGER.error('Failed to enqueue SMS (queue full): %s', sms_path)
-                _persist_or_dlq(sms_path, modem_index)
+                enqueue_persist_failure(sms_path, modem_index, 'persist queue full')
         except Exception as exc:
             _LOGGER.exception('Failed to enqueue SMS %s: %s', sms_path, exc)
-            _persist_or_dlq(sms_path, modem_index)
+            enqueue_persist_failure(sms_path, modem_index, str(exc))
 
     return _on_added
 
@@ -273,6 +277,13 @@ async def run_modem_added_listener(
                     with contextlib.suppress(asyncio.CancelledError):
                         await recovery_task
             _LOGGER.warning('D-Bus disconnected for modem path %s; reconnecting...', path)
+            try:
+                exec_loop = asyncio.get_running_loop()
+                snap = functools.partial(sync_modem_sms_snapshot, modem_index)
+                await exec_loop.run_in_executor(None, snap)
+                _LOGGER.info('Post-disconnect snapshot queued for modem %s', modem_index)
+            except Exception as exc:
+                _LOGGER.warning('Post-disconnect snapshot failed modem %s: %s', modem_index, exc)
 
         except DBusError as exc:
             _LOGGER.warning('SMS watcher D-Bus error (%s): %s', modem_index, exc)

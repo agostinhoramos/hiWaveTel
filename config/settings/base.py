@@ -185,7 +185,7 @@ if SMS_ROTATION_BATCH_SIZE <= 0:
 SMS_CLEANUP_ON_STARTUP = truthy_env('SMS_CLEANUP_ON_STARTUP', default=False)
 
 # SMS reliability & recovery (apps/sms/dbus_watch.py, dead_letter_queue.py)
-MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC = positive_int_env('MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 300)
+MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC = positive_int_env('MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 60)
 SMS_DLQ_ENABLED = truthy_env('SMS_DLQ_ENABLED', default=True)
 SMS_DLQ_DB_PATH = os.environ.get('SMS_DLQ_DB_PATH', str(BASE_DIR / 'dlq_sms.db'))
 SMS_DLQ_MAX_SIZE = positive_int_env('SMS_DLQ_MAX_SIZE', 1000)
@@ -214,6 +214,16 @@ except ValueError:
     INBOUND_PROCESSOR_RETRY_BASE_SEC = 1.0
 if INBOUND_PROCESSOR_RETRY_BASE_SEC <= 0:
     INBOUND_PROCESSOR_RETRY_BASE_SEC = 1.0
+
+# Durable webhook outbox worker (apps/sms/webhook_outbox.py, run_webhook_worker)
+WEBHOOK_WORKER_THREADS = positive_int_env('WEBHOOK_WORKER_THREADS', INBOUND_PROCESSOR_WORKERS)
+_webhook_poll_raw = os.environ.get('WEBHOOK_WORKER_POLL_SEC', '0.5').strip()
+try:
+    WEBHOOK_WORKER_POLL_SEC = float(_webhook_poll_raw) if _webhook_poll_raw else 0.5
+except ValueError:
+    WEBHOOK_WORKER_POLL_SEC = 0.5
+WEBHOOK_JOB_MAX_ATTEMPTS = positive_int_env('WEBHOOK_JOB_MAX_ATTEMPTS', 10)
+WEBHOOK_JOB_STALE_SEC = positive_int_env('WEBHOOK_JOB_STALE_SEC', 300)
 
 # Outbound SMS async processor (apps/sms/outbound_processor.py)
 OUTBOUND_ASYNC_ENABLED = truthy_env('OUTBOUND_ASYNC_ENABLED', default=False)

@@ -7,10 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.test import override_settings
 
-from apps.sms.models import InboundSms, InboundWebhook
+from apps.sms.models import InboundSms, InboundWebhook, OutboundSms
 from apps.sms.webhook_delivery import (
     build_inbound_webhook_payload,
+    build_outbound_webhook_payload,
     deliver_inbound_webhooks,
+    deliver_outbound_webhooks,
     get_active_webhook_urls,
     normalize_webhook_url,
 )
@@ -53,7 +55,24 @@ def test_get_active_webhook_urls_filters_by_modem():
 
 
 @pytest.mark.django_db
-def test_get_active_webhook_urls_filters_by_modem():
+def test_build_outbound_webhook_payload():
+    outbound = OutboundSms.objects.create(
+        modem_index=0,
+        to_number='+351913000387',
+        text='test message',
+        state=OutboundSms.State.SENT,
+    )
+    payload = build_outbound_webhook_payload(outbound)
+    assert payload['id'] == outbound.pk
+    assert payload['sender'] == 'me'
+    assert payload['body'] == 'test message'
+    assert payload['modem_index'] == 0
+    assert payload['mm_state'] == 'sended'
+    assert payload['received_at']
+
+
+@pytest.mark.django_db
+def test_get_active_webhook_urls_filters_by_modem_index():
     InboundWebhook.objects.create(
         modem_index=0,
         name='m0',
@@ -104,6 +123,38 @@ def test_deliver_inbound_webhooks_success():
     with patch('urllib.request.urlopen', return_value=mock_resp) as mock_open:
         assert deliver_inbound_webhooks(inbound) is True
     mock_open.assert_called_once()
+
+
+@pytest.mark.django_db
+@override_settings(
+    SMS_WEBHOOK_RETRY_MAX=3,
+    SMS_WEBHOOK_RETRY_BASE_SEC=0.01,
+)
+def test_deliver_outbound_webhooks_success():
+    InboundWebhook.objects.create(
+        modem_index=0,
+        name='hook',
+        url='http://a.test/hook',
+        enabled=True,
+    )
+    outbound = OutboundSms.objects.create(
+        modem_index=0,
+        to_number='+351913000387',
+        text='test message',
+        state=OutboundSms.State.SENT,
+    )
+    mock_resp = MagicMock()
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_resp.status = 200
+    mock_resp.getcode = MagicMock(return_value=200)
+
+    with patch('urllib.request.urlopen', return_value=mock_resp) as mock_open:
+        assert deliver_outbound_webhooks(outbound) is True
+    mock_open.assert_called_once()
+    sent_body = mock_open.call_args[0][0].data.decode('utf-8')
+    assert '"sender": "me"' in sent_body
+    assert '"mm_state": "sended"' in sent_body
 
 
 @pytest.mark.django_db

@@ -21,12 +21,14 @@ def test_startup_snapshot_retries_then_persists():
     paths_first = ['/org/freedesktop/ModemManager1/SMS/1']
     boom = MMCLIClient()
     boom.list_sms_paths = MagicMock(side_effect=[MmcliError('boom', exit_code=1), paths_first])
+    mock_queue = MagicMock()
+    mock_queue.enqueue.return_value = True
 
-    with patch.object(dbus_watch, 'persist_inbound_sms') as mock_persist:
+    with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
         with patch('apps.sms.dbus_watch.time.sleep', return_value=None):
             n = dbus_watch.sync_modem_sms_snapshot(0, boom)
     assert n == 1
-    assert mock_persist.call_count >= 1
+    mock_queue.enqueue.assert_called_once_with(paths_first[0], 0)
 
 
 def test_startup_snapshot_returns_zero_when_list_always_fails():
@@ -84,17 +86,21 @@ def test_on_added_enqueues_sms_when_received_false():
 
 
 def test_on_added_fallback_when_queue_full():
-    """When enqueue returns False (queue full), falls back to direct persist."""
+    """When enqueue returns False (queue full), path goes to DLQ."""
     mock_queue = MagicMock()
     mock_queue.enqueue.return_value = False
 
     with patch('apps.sms.dbus_watch.get_sms_queue', return_value=mock_queue):
-        with patch('apps.sms.dbus_watch.persist_inbound_sms') as mock_persist:
+        with patch('apps.sms.dbus_watch.enqueue_persist_failure') as mock_dlq:
             callback = dbus_watch._make_on_added_callback(modem_index=1)
             callback('/org/freedesktop/ModemManager1/SMS/456', True)
 
     mock_queue.enqueue.assert_called_once()
-    mock_persist.assert_called_once_with('/org/freedesktop/ModemManager1/SMS/456', 1, None)
+    mock_dlq.assert_called_once_with(
+        '/org/freedesktop/ModemManager1/SMS/456',
+        1,
+        'persist queue full',
+    )
 
 
 def test_on_added_does_not_raise_on_enqueue_exception():

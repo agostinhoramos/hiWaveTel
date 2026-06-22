@@ -23,7 +23,8 @@ Referência OpenAPI: `GET /api/schema/` · Swagger UI: `GET /api/docs/`
 
 Processos em segundo plano (Docker `RUN_SMS_WATCHER=true`):
 
-- **`run_sms_watcher`** — escuta D-Bus `Messaging.Added`, persiste `InboundSms`, dispara webhooks.
+- **`run_sms_watcher`** — escuta D-Bus `Messaging.Added`, enfileira persistência (`SmsProcessingQueue`) e grava `InboundSms` na BD.
+- **`run_webhook_worker`** — processo separado; lê jobs `WebhookDeliveryJob` da BD e envia HTTP POST aos webhooks (fila durável antes da entrega).
 - **`sync_modems`** — no arranque Docker, regista modems detectados em `ModemDevice`.
 
 ---
@@ -174,6 +175,8 @@ Remove o webhook. Resposta **204 No Content** em sucesso.
 
 ### Payload entregue ao destino
 
+**SMS recebido** (modem → cliente):
+
 ```json
 {
   "id": 123,
@@ -184,6 +187,21 @@ Remove o webhook. Resposta **204 No Content** em sucesso.
   "mm_state": "received"
 }
 ```
+
+**SMS enviado** via `POST /api/sms/send/` (cliente → modem):
+
+```json
+{
+  "id": 140,
+  "sender": "me",
+  "body": "test message",
+  "modem_index": 0,
+  "received_at": "2026-06-22T14:01:50.729408+00:00",
+  "mm_state": "sended"
+}
+```
+
+O eco do modem na caixa de mensagens (D-Bus) **não** dispara um segundo webhook — só o envio bem-sucedido pela API notifica com o payload acima.
 
 ### Retry
 
@@ -244,10 +262,13 @@ Ver `.env.example`. Principais:
 | `HIWAVE_PORT` | Porta HTTP (ex.: 5202) |
 | `MODEM_N_DEVICE_PIN_CODE` | PIN SIM do modem índice N (ex.: `MODEM_0_DEVICE_PIN_CODE`) |
 | `MODEM_N_DEVICE_PHONE_NUMBER` | MSISDN fallback quando mmcli não reporta número |
-| `RUN_SMS_WATCHER` | Arrancar watchers D-Bus para todos os modems detectados |
+| `RUN_SMS_WATCHER` | Supervisor D-Bus + fila de persistência por modem |
+| `RUN_WEBHOOK_WORKER` | Worker separado: fila BD → HTTP webhooks |
+| `SMS_QUEUE_WORKERS` | Threads que persistem SMS (mmcli → BD) |
+| `WEBHOOK_WORKER_THREADS` | Threads do worker de webhooks |
+| `MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC` | Re-sync mmcli para recuperar SMS (default 60s) |
 | `HIWAVE_ALLOW_CONTAINER_RESTART_API` | Permitir restart via API (default: true) |
 | `HIWAVE_CONTAINER_RESTART_DELAY_SEC` | Delay antes do SIGTERM (default: 1.0) |
-| `INBOUND_PROCESSOR_WORKERS` | Workers fila pós-save inbound |
 | `OUTBOUND_ASYNC_ENABLED` | Envio outbound assíncrono |
 
 Hardware (ttyUSB, `cdc-wdm`, `wwan0`) e timeouts avançados: `docker/docker-compose.yml` e secção comentada em `.env.example`.

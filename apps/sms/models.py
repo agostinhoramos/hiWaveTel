@@ -93,3 +93,54 @@ class InboundWebhook(models.Model):
 
     def __str__(self) -> str:
         return f'{self.name} modem={self.modem_index} ({self.url})'
+
+
+class WebhookDeliveryJob(models.Model):
+    """Durable queue: persist webhook work in DB before HTTP delivery."""
+
+    class Kind(models.TextChoices):
+        INBOUND = 'inbound', 'Inbound'
+        OUTBOUND = 'outbound', 'Outbound'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        PROCESSING = 'processing', 'Processing'
+        DELIVERED = 'delivered', 'Delivered'
+        FAILED = 'failed', 'Failed'
+
+    kind = models.CharField(max_length=16, choices=Kind.choices, db_index=True)
+    inbound_sms = models.OneToOneField(
+        InboundSms,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='webhook_job',
+    )
+    outbound_sms = models.OneToOneField(
+        OutboundSms,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='webhook_job',
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    attempts = models.PositiveSmallIntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['status', 'created_at']),
+        ]
+
+    def __str__(self) -> str:
+        ref = self.inbound_sms_id or self.outbound_sms_id
+        return f'{self.kind} job={self.pk} ref={ref} ({self.status})'

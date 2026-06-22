@@ -291,7 +291,13 @@ fi
 if truthy "${RUN_SMS_WATCHER:-}"; then
   HIWAVETEL_ROLE=watcher HIWAVETEL_QUEUE_ENABLED=true \
     python manage.py run_sms_watcher --all-modems &
-  echo 'SMS watchers (--all-modems) started in background.'
+  echo 'SMS watcher supervisor (--all-modems) started in background.'
+fi
+
+if truthy "${RUN_WEBHOOK_WORKER:-true}"; then
+  HIWAVETEL_ROLE=webhook HIWAVETEL_QUEUE_ENABLED=true \
+    python manage.py run_webhook_worker &
+  echo 'Webhook delivery worker started in background.'
 fi
 
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"

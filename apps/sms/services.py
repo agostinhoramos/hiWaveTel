@@ -403,6 +403,18 @@ def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None
 
             outbound.state = OutboundSms.State.SENT
             outbound.save(update_fields=('state',))
+
+            from django.db import transaction
+
+            from .webhook_outbox import schedule_outbound_webhook
+
+            def _queue_webhook() -> None:
+                try:
+                    schedule_outbound_webhook(outbound)
+                except Exception:
+                    _LOGGER.exception('Failed to queue outbound webhook pk=%s', outbound.pk)
+
+            transaction.on_commit(_queue_webhook)
             return outbound
         except MmcliError as exc:
             outbound.state = OutboundSms.State.FAILED
