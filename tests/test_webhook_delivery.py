@@ -9,6 +9,8 @@ from django.test import override_settings
 
 from apps.sms.models import InboundSms, InboundWebhook, OutboundSms
 from apps.sms.webhook_delivery import (
+    _post_json,
+    _webhook_ssl_context,
     build_inbound_webhook_payload,
     build_outbound_webhook_payload,
     deliver_inbound_webhooks,
@@ -230,3 +232,56 @@ def test_deliver_inbound_webhooks_does_not_use_other_modem_urls():
     with patch('urllib.request.urlopen') as mock_open:
         assert deliver_inbound_webhooks(inbound) is True
     mock_open.assert_not_called()
+
+
+@override_settings(SMS_WEBHOOK_SSL_VERIFY=False)
+def test_webhook_ssl_context_disables_verification():
+    import ssl
+
+    ctx = _webhook_ssl_context()
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_NONE
+    assert ctx.check_hostname is False
+
+
+@override_settings(SMS_WEBHOOK_SSL_VERIFY=True)
+def test_webhook_ssl_context_uses_default_when_verify_enabled():
+    assert _webhook_ssl_context() is None
+
+
+@override_settings(SMS_WEBHOOK_SSL_VERIFY=False)
+def test_post_json_passes_unverified_ssl_context():
+    import ssl
+
+    mock_resp = MagicMock()
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_resp.status = 200
+    mock_resp.getcode = MagicMock(return_value=200)
+
+    with patch('urllib.request.urlopen', return_value=mock_resp) as mock_open:
+        ok, err = _post_json('https://dev.test/hook', {'x': 1}, timeout_sec=5)
+
+    assert ok is True
+    assert err == ''
+    _, kwargs = mock_open.call_args
+    ctx = kwargs['context']
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+@override_settings(SMS_WEBHOOK_SSL_VERIFY=True)
+def test_post_json_uses_default_ssl_when_verify_enabled():
+    mock_resp = MagicMock()
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_resp.status = 200
+    mock_resp.getcode = MagicMock(return_value=200)
+
+    with patch('urllib.request.urlopen', return_value=mock_resp) as mock_open:
+        ok, err = _post_json('https://dev.test/hook', {'x': 1}, timeout_sec=5)
+
+    assert ok is True
+    assert err == ''
+    _, kwargs = mock_open.call_args
+    assert kwargs['context'] is None

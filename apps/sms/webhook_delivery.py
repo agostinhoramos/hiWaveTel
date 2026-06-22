@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +14,7 @@ from typing import Any
 from django.conf import settings
 
 _LOGGER = logging.getLogger(__name__)
+_ssl_verify_disabled_logged = False
 
 _WEBHOOK_SITE_EDIT_RE = re.compile(
     r'^https://webhook\.site/#!/edit/(?P<token>[a-f0-9-]{36})\/?$',
@@ -173,7 +175,19 @@ def deliver_inbound_webhooks(inbound) -> bool:
     )
 
 
+def _webhook_ssl_context() -> ssl.SSLContext | None:
+    """Return SSL context for webhook POST; None uses Python default certificate verification."""
+    if getattr(settings, 'SMS_WEBHOOK_SSL_VERIFY', False):
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _post_json(url: str, payload: dict[str, Any], *, timeout_sec: float) -> tuple[bool, str]:
+    global _ssl_verify_disabled_logged
+
     body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(
         url,
@@ -181,8 +195,12 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout_sec: float) -> tupl
         headers={'Content-Type': 'application/json'},
         method='POST',
     )
+    ssl_context = _webhook_ssl_context()
+    if ssl_context is not None and not _ssl_verify_disabled_logged:
+        _LOGGER.info('Webhook SSL certificate verification disabled (SMS_WEBHOOK_SSL_VERIFY=false)')
+        _ssl_verify_disabled_logged = True
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_context) as resp:
             code = getattr(resp, 'status', None) or resp.getcode()
             if 200 <= int(code) < 300:
                 return True, ''

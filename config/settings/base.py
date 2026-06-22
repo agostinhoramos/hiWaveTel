@@ -163,6 +163,7 @@ try:
     SMS_WEBHOOK_RETRY_BASE_SEC = float(_webhook_retry_base_raw) if _webhook_retry_base_raw else 1.0
 except ValueError:
     SMS_WEBHOOK_RETRY_BASE_SEC = 1.0
+SMS_WEBHOOK_SSL_VERIFY = truthy_env('SMS_WEBHOOK_SSL_VERIFY', default=False)
 
 # Container restart API (apps/sms/container_restart.py)
 HIWAVE_ALLOW_CONTAINER_RESTART_API = truthy_env('HIWAVE_ALLOW_CONTAINER_RESTART_API', default=True)

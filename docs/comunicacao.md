@@ -210,6 +210,7 @@ O eco do modem na caixa de mensagens (D-Bus) **não** dispara um segundo webhook
 | `SMS_WEBHOOK_TIMEOUT_SEC` | 15 | Timeout HTTP por tentativa |
 | `SMS_WEBHOOK_RETRY_MAX` | 5 | Tentativas por URL |
 | `SMS_WEBHOOK_RETRY_BASE_SEC` | 1.0 | Backoff exponencial (máx. 60s) |
+| `SMS_WEBHOOK_SSL_VERIFY` | false | Verificar certificado HTTPS do destino (`false` = aceitar self-signed) |
 
 O servidor destino deve responder **2xx**. Corpo da resposta é ignorado.
 
