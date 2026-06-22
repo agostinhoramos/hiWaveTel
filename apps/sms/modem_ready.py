@@ -8,6 +8,8 @@ import re
 import subprocess
 import time
 
+from apps.sms.modem_env import get_modem_pin_code
+
 _LOGGER = logging.getLogger(__name__)
 
 _STATE_LINE_RE = re.compile(r'state:\s*([a-z_-]+)', re.IGNORECASE)
@@ -120,9 +122,13 @@ _MODEM_PATH_RE = re.compile(r'/org/freedesktop/ModemManager1/Modem/(\d+)')
 
 def try_unlock_sim_pin(modem_index: int, *, pin: str | None = None, mmcli_path: str | None = None) -> bool:
     """Run ``mmcli --pin`` on SIM and/or modem when the overview reports SIM-PIN lock."""
-    code = (pin if pin is not None else os.environ.get('DEVICE_PIN_CODE', '')).strip().strip('"').strip("'")
+    code = pin if pin is not None else get_modem_pin_code(modem_index)
     if not code:
-        _LOGGER.warning('Modem %s locked but DEVICE_PIN_CODE is not set', modem_index)
+        _LOGGER.warning(
+            'Modem %s locked but %s is not set',
+            modem_index,
+            f'MODEM_{modem_index}_DEVICE_PIN_CODE',
+        )
         return False
     path = mmcli_path or _mmcli_path()
     unlock_timeout = float(os.environ.get('SIM_UNLOCK_TIMEOUT_SEC', '60'))

@@ -18,7 +18,12 @@ def test_run_sms_watcher_keyboard_interrupt(capsys):
         raise KeyboardInterrupt
 
     with patch.object(cmd_mod.asyncio, 'run', side_effect=abort_run):
-        cmd_mod.Command().handle(modem_index=0, reconnect_after=5.0, skip_initial_sync=False)
+        cmd_mod.Command().handle(
+            modem_index=0,
+            reconnect_after=5.0,
+            skip_initial_sync=False,
+            all_modems=False,
+        )
 
     out = capsys.readouterr().out.lower()
     assert 'interrupt' in out

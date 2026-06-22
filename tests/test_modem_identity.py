@@ -49,7 +49,7 @@ def test_probe_modem_identity_env_fallback(monkeypatch):
     mock_client.show_modem.return_value = {}
     mock_client.mmcli_path = 'mmcli'
 
-    monkeypatch.setenv('DEVICE_PHONE_NUMBER', '351913000387')
+    monkeypatch.setenv('MODEM_0_DEVICE_PHONE_NUMBER', '351913000387')
     identity = probe_modem_identity(0, client=mock_client)
 
     assert identity['phone_number'] == '+351913000387'

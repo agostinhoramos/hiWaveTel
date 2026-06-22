@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any
 
@@ -90,8 +89,10 @@ def probe_modem_identity(
     if not phone:
         override = phone_override
         if override is None:
-            override = os.environ.get('DEVICE_PHONE_NUMBER', '')
-        phone = normalize_phone_e164(override)
+            from apps.sms.modem_env import get_modem_phone_number
+
+            override = get_modem_phone_number(modem_index)
+        phone = normalize_phone_e164(override) if override else ''
 
     return {
         'modem_index': modem_index,

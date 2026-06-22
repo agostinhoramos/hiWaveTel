@@ -85,6 +85,38 @@ def sync_detected_modems(*, client: MMCLIClient | None = None) -> list[ModemDevi
     return list(ModemDevice.objects.order_by('modem_index'))
 
 
+def list_present_modem_indices(*, client: MMCLIClient | None = None) -> list[int]:
+    """Return mmcli indices for modems marked present in the registry (falls back to mmcli -L)."""
+    from apps.sms.models import ModemDevice
+
+    present = list(
+        ModemDevice.objects.filter(is_present=True).order_by('modem_index').values_list(
+            'modem_index',
+            flat=True,
+        ),
+    )
+    if present:
+        return present
+    try:
+        return list_enumerated_modem_indices(client=client)
+    except Exception:
+        return []
+
+
+def list_watcher_modem_indices(*, client: MMCLIClient | None = None) -> list[int]:
+    """Modems that should run an inbound SMS watcher (present and enabled)."""
+    from apps.sms.models import ModemDevice
+
+    indices = list(
+        ModemDevice.objects.filter(is_present=True, enabled=True)
+        .order_by('modem_index')
+        .values_list('modem_index', flat=True),
+    )
+    if indices:
+        return indices
+    return list_present_modem_indices(client=client)
+
+
 def _modem_device_or_none(modem_index: int) -> ModemDevice | None:
     try:
         return ModemDevice.objects.get(modem_index=modem_index)

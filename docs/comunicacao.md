@@ -211,12 +211,15 @@ Ver `.env.example`. Principais:
 | Variável | Descrição |
 |----------|-----------|
 | `HIWAVE_PORT` | Porta HTTP (ex.: 5202) |
-| `MODEM_MMCLI_INDEX` | Índice modem default |
-| `RUN_SMS_WATCHER` | Arrancar watcher D-Bus |
+| `MODEM_N_DEVICE_PIN_CODE` | PIN SIM do modem índice N (ex.: `MODEM_0_DEVICE_PIN_CODE`) |
+| `MODEM_N_DEVICE_PHONE_NUMBER` | MSISDN fallback quando mmcli não reporta número |
+| `RUN_SMS_WATCHER` | Arrancar watchers D-Bus para todos os modems detectados |
 | `HIWAVE_ALLOW_CONTAINER_RESTART_API` | Permitir restart via API (default: true) |
 | `HIWAVE_CONTAINER_RESTART_DELAY_SEC` | Delay antes do SIGTERM (default: 1.0) |
 | `INBOUND_PROCESSOR_WORKERS` | Workers fila pós-save inbound |
 | `OUTBOUND_ASYNC_ENABLED` | Envio outbound assíncrono |
+
+Hardware (ttyUSB, `cdc-wdm`, `wwan0`) e timeouts avançados: `docker/docker-compose.yml` e secção comentada em `.env.example`.
 
 ---
 

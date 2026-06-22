@@ -33,61 +33,9 @@ ensure_sqlite_file() {
   fi
 }
 
-# True when the modem overview reports SIM PIN lock (mmcli -m).
-_modem_needs_sim_unlock() {
-  local modem_path="$1"
-  [[ -n "${modem_path}" ]] || return 1
-  mmcli -m "${modem_path}" 2>/dev/null | grep -qiE \
-    '(^|[[:space:]])state:[[:space:]]*locked|lock:[[:space:]]*sim-pin|enabled locks:.*sim'
-}
-
-# True when SIM object reports PIN lock per mmcli -i (skip --pin when already usable).
-_sim_is_locked() {
-  local sim_path="$1"
-  [[ -n "${sim_path}" ]] || return 1
-  mmcli -i "${sim_path}" 2>/dev/null | grep -qiE \
-    'SIM lock status:[[:space:]]*sim-pin|unlock required:[[:space:]]*sim-pin|lock:[[:space:]]*sim-pin|state:[[:space:]]*locked'
-}
-
-_needs_sim_pin_unlock() {
-  local modem_path="$1"
-  local sim_path="$2"
-  _modem_needs_sim_unlock "${modem_path}" && return 0
-  [[ -n "${sim_path}" ]] && _sim_is_locked "${sim_path}" && return 0
-  return 1
-}
-
-_try_unlock_sim_pin() {
-  local modem_path="$1"
-  local sim_path="$2"
-  local pin="$3"
-  local rc=1
-  if [[ -n "${sim_path}" ]]; then
-    echo "SIM unlock: mmcli -i ${sim_path} --pin=***"
-    if mmcli -i "${sim_path}" --pin="${pin}" 2>&1; then
-      return 0
-    fi
-    rc=$?
-  fi
-  if [[ -n "${modem_path}" ]]; then
-    echo "SIM unlock: mmcli -m ${modem_path} --pin=*** (fallback)"
-    if mmcli -m "${modem_path}" --pin="${pin}" 2>&1; then
-      return 0
-    fi
-    rc=$?
-  fi
-  return "${rc}"
-}
-
-# Prefer ModemManager /modem and SIM reported by mmcli (avoids always assuming .../SIM/0).
+# Prefer ModemManager /modem path reported by mmcli (avoids hard-coded indices).
 mmcli_primary_modem_dbuss_path() {
   mmcli -L 2>/dev/null | grep -oE '/org/freedesktop/ModemManager1/Modem/[[:digit:]]+' | head -n1
-}
-
-mmcli_primary_sim_dbuss_path() {
-  local modem_path="$1"
-  [[ -n "${modem_path}" ]] || return 1
-  mmcli -m "${modem_path}" 2>/dev/null | grep -oE '/org/freedesktop/ModemManager1/SIM/[[:digit:]]+' | head -n1
 }
 
 # Expected ports/interfaces (ttyUSB2/3 + wwan0 on host when visible here).
@@ -266,45 +214,11 @@ if [[ "${FOUND}" != "1" ]]; then
   fi
 fi
 
-PIN="${DEVICE_PIN_CODE:-}"
-PIN="${PIN#"${PIN%%[![:space:]]*}"}"
-PIN="${PIN%"${PIN##*[![:space:]]}"}"
 MODEM_DBUS=""
-SIM_DETECT=""
 if [[ "${FOUND}" == "1" ]]; then
   MODEM_DBUS="$(mmcli_primary_modem_dbuss_path)"
-  [[ -z "${MODEM_DBUS:-}" ]] || SIM_DETECT="$(mmcli_primary_sim_dbuss_path "${MODEM_DBUS}")" || true
-fi
-
-SIM_EXPLICIT="${SIM_PATH:-}"
-SIM_EXPLICIT="${SIM_EXPLICIT#"${SIM_EXPLICIT%%[![:space:]]*}"}"
-SIM_EXPLICIT="${SIM_EXPLICIT%"${SIM_EXPLICIT##*[![:space:]]}"}"
-
-SIM=""
-# Prefer SIM path from mmcli (hard-coded SIM_PATH .../SIM/0 is often wrong).
-if truthy "${SIM_PATH_OVERRIDES_MMCLI:-false}" && [[ -n "${SIM_EXPLICIT}" ]]; then
-  SIM="${SIM_EXPLICIT}"
-elif [[ -n "${SIM_DETECT}" ]]; then
-  SIM="${SIM_DETECT}"
-elif [[ -n "${SIM_EXPLICIT}" ]]; then
-  SIM="${SIM_EXPLICIT}"
-fi
-
-if [[ "${FOUND}" == "1" && -n "${MODEM_DBUS:-}" ]]; then
-  echo "modem detected: ${MODEM_DBUS} (SIM unlock/enable deferred to wait_modem_ready)"
-elif [[ "${FOUND}" != "1" ]] && ([[ -n "${PIN}" ]] || [[ -n "${SIM_EXPLICIT}" ]] || [[ -n "${SIM_DETECT}" ]]); then
-  echo 'Skipping early modem setup: modem not enumerated yet (wait_modem_ready will retry).'
-elif [[ "${FOUND}" == "1" && -n "${PIN}" && -z "${MODEM_DBUS:-}" ]]; then
-  echo "PIN set but no modem path from mmcli -L." >&2
-elif [[ "${FOUND}" == "1" && -z "${PIN}" ]] && [[ -n "${SIM_EXPLICIT}" ]]; then
-  echo "SIM_PATH set without DEVICE_PIN_CODE: no unlock attempt (normal if SIM is not PIN-locked)." >&2
-fi
-
-# Re-detect modem path after enumeration (index may change later during wait_modem_ready).
-if [[ "${FOUND}" == "1" ]]; then
-  _mp_after="$(mmcli_primary_modem_dbuss_path)"
-  if [[ -n "${_mp_after}" ]]; then
-    MODEM_DBUS="${_mp_after}"
+  if [[ -n "${MODEM_DBUS:-}" ]]; then
+    echo "modem detected: ${MODEM_DBUS} (unlock/enable deferred to wait_modem_ready --all)"
     echo "modem path: ${MODEM_DBUS}"
   fi
 fi
@@ -330,7 +244,7 @@ if truthy "${SMS_CLEANUP_ON_STARTUP:-false}"; then
   echo "SMS storage cleanup completed (SMS_CLEANUP_ON_STARTUP=true)."
 fi
 
-# Modem index for Django / mmcli -m $N when auto-detect matches first enumerated modem path.
+# Default mmcli index for shells (first enumerated modem, fallback 0).
 DETECT_MMCLI_INDEX=""
 if [[ "${FOUND}" == "1" && -n "${MODEM_DBUS:-}" ]]; then
   DETECT_MMCLI_INDEX="${MODEM_DBUS##*/Modem/}"
@@ -338,30 +252,20 @@ elif [[ "${FOUND}" == "1" ]]; then
   _mp="$(mmcli_primary_modem_dbuss_path)"
   [[ -z "${_mp}" ]] || DETECT_MMCLI_INDEX="${_mp##*/Modem/}"
 fi
-if truthy "${AUTO_DETECT_MMCLI_INDEX:-true}" && [[ -n "${DETECT_MMCLI_INDEX}" ]]; then
-  export MODEM_MMCLI_INDEX="${DETECT_MMCLI_INDEX}"
-  echo "MODEM_MMCLI_INDEX auto-detect: ${MODEM_MMCLI_INDEX} (AUTO_DETECT_MMCLI_INDEX=true)."
-elif [[ -n "${DETECT_MMCLI_INDEX}" ]]; then
-  echo "MODEM_MMCLI_INDEX manual: ${MODEM_MMCLI_INDEX:-0} (would auto-detect as ${DETECT_MMCLI_INDEX}; set AUTO_DETECT_MMCLI_INDEX=true to align)."
-fi
-
-MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"
+MODEM_MMCLI_INDEX="${DETECT_MMCLI_INDEX:-${MODEM_MMCLI_INDEX:-0}}"
+export MODEM_MMCLI_INDEX
 mkdir -p /etc/profile.d
 printf 'export MODEM_MMCLI_INDEX=%s\n' "${MODEM_MMCLI_INDEX}" > /etc/profile.d/hiwavetel-modem.sh
-echo "Interactive shells: MODEM_MMCLI_INDEX=${MODEM_MMCLI_INDEX} (see /etc/profile.d/hiwavetel-modem.sh)."
+echo "Default MODEM_MMCLI_INDEX=${MODEM_MMCLI_INDEX} (see /etc/profile.d/hiwavetel-modem.sh)."
 
-echo "Waiting for modem ${MODEM_MMCLI_INDEX} SMS/Messaging readiness ..."
-if python manage.py wait_modem_ready --modem-index "${MODEM_MMCLI_INDEX}"; then
-  _resolved_idx="$(python -c "import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); import django; django.setup(); from apps.sms.mmcli_client import resolve_modem_mmcli_index; print(resolve_modem_mmcli_index(${MODEM_MMCLI_INDEX}))")"
-  if [[ -n "${_resolved_idx}" && "${_resolved_idx}" != "${MODEM_MMCLI_INDEX}" ]]; then
-    MODEM_MMCLI_INDEX="${_resolved_idx}"
-    export MODEM_MMCLI_INDEX
-    printf 'export MODEM_MMCLI_INDEX=%s\n' "${MODEM_MMCLI_INDEX}" > /etc/profile.d/hiwavetel-modem.sh
-    echo "MODEM_MMCLI_INDEX aligned to ${_resolved_idx} after readiness wait."
-  fi
-  echo "Modem ${MODEM_MMCLI_INDEX} SMS/Messaging ready."
+echo 'Syncing detected modems to database ...'
+python manage.py sync_modems || echo 'warning: sync_modems failed (API modem registry may be stale).' >&2
+
+echo 'Waiting for all modems SMS/Messaging readiness ...'
+if python manage.py wait_modem_ready --all; then
+  echo 'All modems SMS/Messaging ready.'
 else
-  echo "warning: modem ${MODEM_MMCLI_INDEX} not ready; restarting ModemManager once for QMI recovery ..." >&2
+  echo "warning: one or more modems not ready; restarting ModemManager once for QMI recovery ..." >&2
   kill "${MM_PID}" 2>/dev/null || true
   wait "${MM_PID}" 2>/dev/null || true
   sleep 3
@@ -376,21 +280,18 @@ else
     sleep "${MODEM_MM_WARMUP_SEC}"
   fi
   mmcli -S >/dev/null 2>&1 || true
-  if python manage.py wait_modem_ready --modem-index "${MODEM_MMCLI_INDEX}"; then
-    echo "Modem ${MODEM_MMCLI_INDEX} SMS/Messaging ready after ModemManager restart."
+  python manage.py sync_modems || true
+  if python manage.py wait_modem_ready --all; then
+    echo 'All modems SMS/Messaging ready after ModemManager restart.'
   else
-    echo "warning: modem ${MODEM_MMCLI_INDEX} still not ready; SMS watcher will keep retrying." >&2
+    echo 'warning: one or more modems still not ready; SMS watcher will keep retrying.' >&2
   fi
 fi
 
-echo 'Syncing detected modems to database ...'
-python manage.py sync_modems || echo 'warning: sync_modems failed (API modem registry may be stale).' >&2
-
 if truthy "${RUN_SMS_WATCHER:-}"; then
-  MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"
   HIWAVETEL_ROLE=watcher HIWAVETEL_QUEUE_ENABLED=true \
-    python manage.py run_sms_watcher --modem-index "${MODEM_MMCLI_INDEX}" &
-  echo "SMS watcher (modem_index=${MODEM_MMCLI_INDEX}) in background."
+    python manage.py run_sms_watcher --all-modems &
+  echo 'SMS watchers (--all-modems) started in background.'
 fi
 
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"

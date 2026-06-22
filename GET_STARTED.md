@@ -47,7 +47,15 @@ docker compose -f docker/docker-compose.yml down
 docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-Ensure **`.env`** has the correct **`DEVICE_PIN_CODE`** (SIM PIN). On startup you should see `PIN: unlock succeeded` and `modem … state=registered` (or `enabled`) in the container logs.
+Ensure **`.env`** defines per-modem SIM PIN and optional phone fallback (mmcli index `N` from `mmcli -L`):
+
+```bash
+MODEM_0_DEVICE_PIN_CODE='1369'
+MODEM_0_DEVICE_PHONE_NUMBER=351961343706
+# MODEM_1_DEVICE_PIN_CODE='3333'
+```
+
+On startup you should see `All modems SMS/Messaging ready` and `SMS watchers (--all-modems) started` in the container logs.
 
 ### SQLite concurrency (default deploy)
 

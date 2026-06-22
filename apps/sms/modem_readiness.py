@@ -10,6 +10,7 @@ from typing import Any
 from django.conf import settings
 from django.utils import timezone
 
+from apps.sms.modem_env import get_modem_phone_number
 from apps.sms.modem_identity import normalize_phone_e164, probe_modem_identity
 from apps.sms.mmcli_client import MMCLIClient, MmcliError, resolve_modem_mmcli_index
 from apps.sms.models import InboundSms, OutboundSms
@@ -94,7 +95,7 @@ def _truthy_env(name: str, default: bool = False) -> bool:
 
 
 def _resolve_phone_fallback(modem_index: int) -> str:
-    return normalize_phone_e164(os.environ.get('DEVICE_PHONE_NUMBER', ''))
+    return get_modem_phone_number(modem_index)
 
 
 def _load_last_persisted(phone_number: str) -> str | None:
@@ -323,7 +324,7 @@ def _resolve_modem_phone_number(
         identity = probe_modem_identity(modem_index, client=client)
         return normalize_phone_e164(identity.get('phone_number') or '')
     except Exception:
-        return normalize_phone_e164(os.environ.get('DEVICE_PHONE_NUMBER', ''))
+        return get_modem_phone_number(modem_index)
 
 
 def check_modem_availability(
