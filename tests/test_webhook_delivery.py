@@ -12,11 +12,30 @@ from apps.sms.webhook_delivery import (
     build_inbound_webhook_payload,
     deliver_inbound_webhooks,
     get_active_webhook_urls,
+    normalize_webhook_url,
 )
 
 
+def test_normalize_webhook_site_edit_url():
+    raw = 'https://webhook.site/#!/edit/e6138d12-ca64-4caa-ae32-fd304cdc063d'
+    assert normalize_webhook_url(raw) == 'https://webhook.site/e6138d12-ca64-4caa-ae32-fd304cdc063d'
+
+
 @pytest.mark.django_db
-def test_build_inbound_webhook_payload():
+def test_get_active_webhook_urls_normalizes_webhook_site():
+    InboundWebhook.objects.create(
+        modem_index=0,
+        name='wh',
+        url='https://webhook.site/#!/edit/e6138d12-ca64-4caa-ae32-fd304cdc063d',
+        enabled=True,
+    )
+    assert get_active_webhook_urls(0) == [
+        'https://webhook.site/e6138d12-ca64-4caa-ae32-fd304cdc063d',
+    ]
+
+
+@pytest.mark.django_db
+def test_get_active_webhook_urls_filters_by_modem():
     inbound = InboundSms.objects.create(
         mm_path='/org/freedesktop/ModemManager1/SMS/wh1',
         modem_index=0,

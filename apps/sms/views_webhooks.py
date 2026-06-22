@@ -49,9 +49,10 @@ class ModemWebhookCreateView(APIView):
 
         serializer = InboundWebhookCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
         webhook = InboundWebhook.objects.create(
             modem_index=modem_index,
-            **serializer.validated_data,
+            **data,
         )
         return Response(
             InboundWebhookSerializer(webhook).data,

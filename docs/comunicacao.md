@@ -141,6 +141,8 @@ Lista todos os webhooks (`id`, `modem_index`, `name`, `url`, `enabled`, `created
 
 **404** se o índice não estiver enumerado pelo ModemManager.
 
+Use o **URL de endpoint** do destino (ex.: `https://webhook.site/{uuid}`), não a página de edição do browser (`#!/edit/...`). O gateway normaliza automaticamente URLs webhook.site mal copiadas.
+
 ### Payload entregue ao destino
 
 ```json

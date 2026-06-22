@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +13,30 @@ from typing import Any
 from django.conf import settings
 
 _LOGGER = logging.getLogger(__name__)
+
+_WEBHOOK_SITE_EDIT_RE = re.compile(
+    r'^https://webhook\.site/#!/edit/(?P<token>[a-f0-9-]{36})\/?$',
+    re.IGNORECASE,
+)
+_WEBHOOK_SITE_VIEW_RE = re.compile(
+    r'^https://webhook\.site/#!/view/(?P<token>[a-f0-9-]{36})\/?$',
+    re.IGNORECASE,
+)
+
+
+def normalize_webhook_url(url: str) -> str:
+    """Return a POST-able webhook URL (fixes common webhook.site UI copy-paste mistakes)."""
+    u = (url or '').strip()
+    if not u:
+        return u
+    for pattern in (_WEBHOOK_SITE_EDIT_RE, _WEBHOOK_SITE_VIEW_RE):
+        match = pattern.match(u)
+        if match:
+            normalized = f'https://webhook.site/{match.group("token")}'
+            if normalized != u:
+                _LOGGER.info('Normalized webhook URL %s -> %s', u, normalized)
+            return normalized
+    return u
 
 
 def get_active_webhook_urls(modem_index: int) -> list[str]:
@@ -24,7 +49,7 @@ def get_active_webhook_urls(modem_index: int) -> list[str]:
         enabled=True,
         modem_index=modem_index,
     ).order_by('id'):
-        u = (row.url or '').strip()
+        u = normalize_webhook_url((row.url or '').strip())
         if u and u not in seen:
             seen.add(u)
             urls.append(u)
@@ -66,12 +91,19 @@ def deliver_inbound_webhooks(inbound) -> bool:
     """POST inbound payload to active webhook URLs for this modem. Returns True if all succeeded."""
     urls = get_active_webhook_urls(inbound.modem_index)
     if not urls:
-        _LOGGER.debug(
+        _LOGGER.info(
             'No inbound webhook URLs for modem_index=%s; skip pk=%s',
             inbound.modem_index,
             inbound.pk,
         )
         return True
+
+    _LOGGER.info(
+        'Delivering inbound pk=%s to %s webhook URL(s) modem_index=%s',
+        inbound.pk,
+        len(urls),
+        inbound.modem_index,
+    )
 
     payload = build_inbound_webhook_payload(inbound)
     timeout = float(getattr(settings, 'SMS_WEBHOOK_TIMEOUT_SEC', 15.0))
