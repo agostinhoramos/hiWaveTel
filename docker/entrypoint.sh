@@ -212,11 +212,17 @@ for _i in $(seq 1 60); do
   sleep 0.2
 done
 
+MODEM_MM_WARMUP_SEC="${MODEM_MM_WARMUP_SEC:-5}"
+if [[ "${MODEM_MM_WARMUP_SEC}" -gt 0 ]]; then
+  echo "ModemManager warmup ${MODEM_MM_WARMUP_SEC}s before enumeration ..."
+  sleep "${MODEM_MM_WARMUP_SEC}"
+fi
+
 echo "mmcli -S (rescan ModemManager) ..."
 MMCLI_SCAN_TRIES="${MMCLI_SCAN_TRIES:-1}"
 MMCLI_SCAN_SLEEP_SEC="${MMCLI_SCAN_SLEEP_SEC:-1}"
 for _try in $(seq 1 "${MMCLI_SCAN_TRIES}"); do
-  if mmcli -S 2>/dev/null; then
+  if mmcli -S >/dev/null 2>&1; then
     echo "mmcli -S OK (attempt ${_try}/${MMCLI_SCAN_TRIES})"
     break
   fi
@@ -285,75 +291,21 @@ elif [[ -n "${SIM_EXPLICIT}" ]]; then
 fi
 
 if [[ "${FOUND}" == "1" && -n "${MODEM_DBUS:-}" ]]; then
-  _modem_state_check() {
-    mmcli -m "${MODEM_DBUS}" 2>/dev/null | grep -oE 'state:[[:space:]]*[a-z]+' | head -n1 | grep -oE '[a-z]+$' || echo 'unknown'
-  }
-  _initial_state="$(_modem_state_check)"
-  echo "modem ${MODEM_DBUS} initial state: ${_initial_state}"
-
-  # Unlock SIM PIN before enable/wait — a locked modem never reaches enabled/registered.
-  if [[ -n "${PIN}" ]]; then
-    if _needs_sim_pin_unlock "${MODEM_DBUS}" "${SIM:-}"; then
-      if [[ "${SIM}" == "${SIM_DETECT}" ]] && [[ -n "${SIM_DETECT}" ]]; then
-        _sim_src="mmcli"
-      elif truthy "${SIM_PATH_OVERRIDES_MMCLI:-false}" && [[ "${SIM}" == "${SIM_EXPLICIT}" ]]; then
-        _sim_src="SIM_PATH+override"
-      elif [[ -n "${SIM}" ]]; then
-        _sim_src="SIM_PATH"
-      else
-        _sim_src="modem"
-      fi
-      echo "SIM unlock (${_sim_src}): modem=${MODEM_DBUS} SIM=${SIM:-n/a} (locked)"
-      if ! _try_unlock_sim_pin "${MODEM_DBUS}" "${SIM:-}" "${PIN}"; then
-        echo "PIN: unlock failed (check DEVICE_PIN_CODE in .env)." >&2
-      else
-        echo "PIN: unlock succeeded."
-        sleep 2
-      fi
-    else
-      echo "SIM unlock: skipped (modem/SIM not reporting SIM-PIN lock)."
-    fi
-  elif _modem_needs_sim_unlock "${MODEM_DBUS}"; then
-    echo "Modem reports SIM-PIN lock but DEVICE_PIN_CODE is empty — set PIN in .env." >&2
-  fi
-
-  # Enable modem if disabled, then wait for enabled/registered (mmcli --messaging-create-sms).
-  if [[ -n "${MODEM_DBUS}" ]]; then
-    MODEM_ENABLE_WAIT_SEC="${MODEM_ENABLE_WAIT_SEC:-20}"
-    _cur_state="$(_modem_state_check)"
-    if [[ "${_cur_state}" == "disabled" ]]; then
-      echo "modem ${MODEM_DBUS} is disabled --- enabling (mmcli --enable) ..."
-      mmcli -m "${MODEM_DBUS}" --enable 2>&1 || echo "warning: mmcli --enable failed (continuing)." >&2
-    fi
-
-    echo "Waiting for ${MODEM_DBUS} to become enabled or registered (timeout ${MODEM_ENABLE_WAIT_SEC}s) ..."
-    for _ in $(seq 1 "${MODEM_ENABLE_WAIT_SEC}"); do
-      _cur="$(_modem_state_check)"
-      if [[ "${_cur}" == "enabled" || "${_cur}" == "registered" ]]; then
-        echo "modem ${MODEM_DBUS} state=${_cur} --- ready for SMS."
-        break
-      fi
-      sleep 1
-    done
-    _final_state="$(_modem_state_check)"
-    if [[ "${_final_state}" != "enabled" && "${_final_state}" != "registered" ]]; then
-      echo "warning: modem ${MODEM_DBUS} still state=${_final_state} after ${MODEM_ENABLE_WAIT_SEC}s (SMS/Messaging may fail)." >&2
-    fi
-  fi
+  echo "modem detected: ${MODEM_DBUS} (SIM unlock/enable deferred to wait_modem_ready)"
 elif [[ "${FOUND}" != "1" ]] && ([[ -n "${PIN}" ]] || [[ -n "${SIM_EXPLICIT}" ]] || [[ -n "${SIM_DETECT}" ]]); then
-  echo 'Skipping PIN/SIM unlock: modem not enumerated yet.'
+  echo 'Skipping early modem setup: modem not enumerated yet (wait_modem_ready will retry).'
 elif [[ "${FOUND}" == "1" && -n "${PIN}" && -z "${MODEM_DBUS:-}" ]]; then
   echo "PIN set but no modem path from mmcli -L." >&2
 elif [[ "${FOUND}" == "1" && -z "${PIN}" ]] && [[ -n "${SIM_EXPLICIT}" ]]; then
   echo "SIM_PATH set without DEVICE_PIN_CODE: no unlock attempt (normal if SIM is not PIN-locked)." >&2
 fi
 
-# After unlock/enable the modem object path often changes (e.g. Modem/0 → Modem/1); re-detect.
+# Re-detect modem path after enumeration (index may change later during wait_modem_ready).
 if [[ "${FOUND}" == "1" ]]; then
   _mp_after="$(mmcli_primary_modem_dbuss_path)"
   if [[ -n "${_mp_after}" ]]; then
     MODEM_DBUS="${_mp_after}"
-    echo "modem path after unlock/enable: ${MODEM_DBUS}"
+    echo "modem path: ${MODEM_DBUS}"
   fi
 fi
 
@@ -372,10 +324,6 @@ cd "${APP_ROOT}"
 python manage.py migrate --noinput
 
 python manage.py ensure_superuser
-
-if [[ "${FOUND}" == "1" ]]; then
-  python manage.py ensure_hidishelink_device --modem-index "${MODEM_MMCLI_INDEX:-0}"
-fi
 
 if truthy "${SMS_CLEANUP_ON_STARTUP:-false}"; then
   python manage.py cleanup_sms_storage
@@ -402,17 +350,47 @@ mkdir -p /etc/profile.d
 printf 'export MODEM_MMCLI_INDEX=%s\n' "${MODEM_MMCLI_INDEX}" > /etc/profile.d/hiwavetel-modem.sh
 echo "Interactive shells: MODEM_MMCLI_INDEX=${MODEM_MMCLI_INDEX} (see /etc/profile.d/hiwavetel-modem.sh)."
 
+echo "Waiting for modem ${MODEM_MMCLI_INDEX} SMS/Messaging readiness ..."
+if python manage.py wait_modem_ready --modem-index "${MODEM_MMCLI_INDEX}"; then
+  _resolved_idx="$(python -c "import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); import django; django.setup(); from apps.sms.mmcli_client import resolve_modem_mmcli_index; print(resolve_modem_mmcli_index(${MODEM_MMCLI_INDEX}))")"
+  if [[ -n "${_resolved_idx}" && "${_resolved_idx}" != "${MODEM_MMCLI_INDEX}" ]]; then
+    MODEM_MMCLI_INDEX="${_resolved_idx}"
+    export MODEM_MMCLI_INDEX
+    printf 'export MODEM_MMCLI_INDEX=%s\n' "${MODEM_MMCLI_INDEX}" > /etc/profile.d/hiwavetel-modem.sh
+    echo "MODEM_MMCLI_INDEX aligned to ${_resolved_idx} after readiness wait."
+  fi
+  echo "Modem ${MODEM_MMCLI_INDEX} SMS/Messaging ready."
+else
+  echo "warning: modem ${MODEM_MMCLI_INDEX} not ready; restarting ModemManager once for QMI recovery ..." >&2
+  kill "${MM_PID}" 2>/dev/null || true
+  wait "${MM_PID}" 2>/dev/null || true
+  sleep 3
+  if truthy "${MODEM_MANAGER_DEBUG:-}"; then
+    ModemManager --debug >/tmp/ModemManager.log 2>&1 &
+  else
+    ModemManager >/tmp/ModemManager.log 2>&1 &
+  fi
+  MM_PID="$!"
+  MODEM_MM_WARMUP_SEC="${MODEM_MM_WARMUP_SEC:-5}"
+  if [[ "${MODEM_MM_WARMUP_SEC}" -gt 0 ]]; then
+    sleep "${MODEM_MM_WARMUP_SEC}"
+  fi
+  mmcli -S >/dev/null 2>&1 || true
+  if python manage.py wait_modem_ready --modem-index "${MODEM_MMCLI_INDEX}"; then
+    echo "Modem ${MODEM_MMCLI_INDEX} SMS/Messaging ready after ModemManager restart."
+  else
+    echo "warning: modem ${MODEM_MMCLI_INDEX} still not ready; SMS watcher will keep retrying." >&2
+  fi
+fi
+
+echo 'Syncing detected modems to database ...'
+python manage.py sync_modems || echo 'warning: sync_modems failed (API modem registry may be stale).' >&2
+
 if truthy "${RUN_SMS_WATCHER:-}"; then
   MODEM_MMCLI_INDEX="${MODEM_MMCLI_INDEX:-0}"
   HIWAVETEL_ROLE=watcher HIWAVETEL_QUEUE_ENABLED=true \
     python manage.py run_sms_watcher --modem-index "${MODEM_MMCLI_INDEX}" &
   echo "SMS watcher (modem_index=${MODEM_MMCLI_INDEX}) in background."
-fi
-
-if truthy "${RUN_MQTT_GATEWAY:-}"; then
-  HIWAVETEL_ROLE=mqtt HIWAVETEL_QUEUE_ENABLED=true \
-    python manage.py run_mqtt_gateway &
-  echo "MQTT gateway (run_mqtt_gateway) in background."
 fi
 
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"

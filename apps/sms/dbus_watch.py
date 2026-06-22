@@ -20,7 +20,7 @@ from django.db import DatabaseError, IntegrityError
 from .dead_letter_queue import enqueue_persist_failure
 from .metrics import get_metrics_collector
 from .mmcli_client import MMCLIClient, MmcliError, resolve_modem_mmcli_index
-from .modem_ready import try_enable_modem as _try_enable_modem
+from .modem_ready import ensure_modem_ready_for_sms, try_enable_modem as _try_enable_modem
 from .queue_processor import get_sms_queue
 from .services import persist_inbound_sms
 
@@ -114,17 +114,12 @@ async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
                 modem_index,
             )
 
-            def _sync_device_inboxes() -> None:
-                from apps.external_device.models import ExternalDevice
-                from apps.external_device.services import sync_inbox_from_modem_store
+            def _refresh_modem_readiness() -> None:
+                from apps.sms.modem_readiness import refresh_readiness_safe
 
-                for device in ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE):
-                    try:
-                        sync_inbox_from_modem_store(device)
-                    except Exception:
-                        _LOGGER.exception('Background inbox sync failed device=%s', device.device_id)
+                refresh_readiness_safe(modem_index)
 
-            await loop.run_in_executor(None, _sync_device_inboxes)
+            await loop.run_in_executor(None, _refresh_modem_readiness)
 
             metrics.increment('periodic_recovery_runs')
             _LOGGER.info(
@@ -214,6 +209,12 @@ async def run_modem_added_listener(
         path = modem_object_path(modem_index)
         bus: MessageBus | None = None
         try:
+            # Wait for modem + Messaging before D-Bus subscribe (handles unknown/failed/reprobe).
+            await loop.run_in_executor(
+                None,
+                lambda: ensure_modem_ready_for_sms(modem_index, require_messaging=True),
+            )
+
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             
             # Retry loop: modem interface may not be ready immediately at startup.

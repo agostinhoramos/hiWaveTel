@@ -183,27 +183,15 @@ class InboundProcessorQueue:
         _LOGGER.info('%s stopped', worker_name)
     
     def _process_inbound(self, inbound_pk: int, worker_name: str) -> None:
-        """
-        Process a single InboundSms: mirror to devices and publish to MQTT.
-        
-        Args:
-            inbound_pk: InboundSms primary key
-            worker_name: Name of worker thread (for logging)
-        """
-        from django.conf import settings
+        """Process a single InboundSms: deliver HTTP webhooks."""
         from apps.sms.models import InboundSms
-        from apps.external_device.services import (
-            publish_inbound_to_remote,
-            publish_inbound_to_remote_ephemeral,
-            sync_single_inbound_to_all_devices,
-        )
-        
+        from apps.sms.webhook_delivery import deliver_inbound_webhooks
+
         start_time = time.time()
-        
+
         try:
             _LOGGER.debug('%s processing inbound_pk=%s', worker_name, inbound_pk)
-            
-            # Fetch InboundSms instance (retry on SQLite lock — worker is outside HTTP txn)
+
             try:
                 inbound = _fetch_inbound_sms(inbound_pk)
             except InboundSms.DoesNotExist:
@@ -211,59 +199,23 @@ class InboundProcessorQueue:
                 with self._metrics_lock:
                     self._failed_count += 1
                 return
-            
-            # Mirror to local devices (non-blocking, sequential due to SQLite constraints)
-            try:
-                sync_single_inbound_to_all_devices(inbound)
-            except Exception as exc:
-                _LOGGER.exception(
-                    '%s: Failed to mirror inbound_pk=%s to devices: %s',
-                    worker_name,
-                    inbound_pk,
-                    exc,
-                )
-                # Continue to remote publish even if local mirror fails
-            
-            # Publish to remote hiDisheLink broker if bridge mode enabled (with retries)
-            if getattr(settings, 'MQTT_REMOTE_BRIDGE_ENABLED', False):
-                from apps.external_device import mqtt_client as mqtt_mod
-                remote_client = getattr(mqtt_mod, '_global_remote_client', None)
 
-                if remote_client is not None:
-                    success = self._publish_with_retry(
-                        inbound,
-                        remote_client,
-                        worker_name,
-                    )
-                else:
-                    success = self._publish_ephemeral_with_retry(
-                        inbound,
-                        worker_name,
-                    )
-
-                if not success:
-                    _LOGGER.error(
-                        '%s: Failed to publish inbound_pk=%s to remote after %s retries '
-                        '(local mirror may have succeeded)',
-                        worker_name,
-                        inbound_pk,
-                        self.retry_max,
-                    )
-                    with self._metrics_lock:
-                        self._failed_count += 1
+            success = deliver_inbound_webhooks(inbound)
+            if not success:
+                with self._metrics_lock:
+                    self._failed_count += 1
+                return
 
             elapsed = time.time() - start_time
             _LOGGER.info(
-                '%s completed inbound_pk=%s in %.3fs processed=%s',
+                '%s completed inbound_pk=%s in %.3fs',
                 worker_name,
                 inbound_pk,
                 elapsed,
-                self._processed_count + 1,
             )
-
             with self._metrics_lock:
                 self._processed_count += 1
-                
+
         except Exception as exc:
             elapsed = time.time() - start_time
             _LOGGER.exception(
@@ -275,115 +227,6 @@ class InboundProcessorQueue:
             )
             with self._metrics_lock:
                 self._failed_count += 1
-    
-    def _publish_with_retry(self, inbound, remote_client, worker_name: str) -> bool:
-        """
-        Publish InboundSms to remote broker with exponential backoff retry.
-        
-        Args:
-            inbound: InboundSms instance
-            remote_client: RemoteHiDishelinkClient instance
-            worker_name: Name of worker thread (for logging)
-            
-        Returns:
-            True if published successfully (within retry limit), False otherwise
-        """
-        from apps.external_device.services import publish_inbound_to_remote
-        
-        for attempt in range(self.retry_max):
-            try:
-                success = publish_inbound_to_remote(inbound, remote_client)
-                if success:
-                    if attempt > 0:
-                        _LOGGER.info(
-                            '%s: Published inbound_pk=%s to remote on attempt %s',
-                            worker_name,
-                            inbound.pk,
-                            attempt + 1,
-                        )
-                    return True
-                
-                # publish_inbound_to_remote returned False (network/timeout issue)
-                if attempt < self.retry_max - 1:
-                    delay = self.retry_base_sec * (2 ** attempt)
-                    delay = min(delay, 60.0)  # Cap at 60 seconds
-                    _LOGGER.warning(
-                        '%s: Remote publish failed for inbound_pk=%s (attempt %s/%s), retrying in %.1fs',
-                        worker_name,
-                        inbound.pk,
-                        attempt + 1,
-                        self.retry_max,
-                        delay,
-                    )
-                    with self._metrics_lock:
-                        self._retry_count += 1
-                    time.sleep(delay)
-                
-            except Exception as exc:
-                _LOGGER.warning(
-                    '%s: Exception during remote publish for inbound_pk=%s (attempt %s/%s): %s',
-                    worker_name,
-                    inbound.pk,
-                    attempt + 1,
-                    self.retry_max,
-                    exc,
-                )
-                if attempt < self.retry_max - 1:
-                    delay = self.retry_base_sec * (2 ** attempt)
-                    delay = min(delay, 60.0)
-                    with self._metrics_lock:
-                        self._retry_count += 1
-                    time.sleep(delay)
-        
-        return False
-
-    def _publish_ephemeral_with_retry(self, inbound, worker_name: str) -> bool:
-        """Publish via ephemeral MQTT when persistent remote client is in another process."""
-        from apps.external_device.services import publish_inbound_to_remote_ephemeral
-
-        for attempt in range(self.retry_max):
-            try:
-                success = publish_inbound_to_remote_ephemeral(inbound)
-                if success:
-                    if attempt > 0:
-                        _LOGGER.info(
-                            '%s: Remote ephemeral publish inbound_pk=%s on attempt %s',
-                            worker_name,
-                            inbound.pk,
-                            attempt + 1,
-                        )
-                    return True
-
-                if attempt < self.retry_max - 1:
-                    delay = min(self.retry_base_sec * (2 ** attempt), 60.0)
-                    _LOGGER.warning(
-                        '%s: Remote ephemeral publish failed inbound_pk=%s (attempt %s/%s), retry in %.1fs',
-                        worker_name,
-                        inbound.pk,
-                        attempt + 1,
-                        self.retry_max,
-                        delay,
-                    )
-                    with self._metrics_lock:
-                        self._retry_count += 1
-                    time.sleep(delay)
-
-            except Exception as exc:
-                _LOGGER.warning(
-                    '%s: Exception during remote ephemeral publish inbound_pk=%s (attempt %s/%s): %s',
-                    worker_name,
-                    inbound.pk,
-                    attempt + 1,
-                    self.retry_max,
-                    exc,
-                )
-                if attempt < self.retry_max - 1:
-                    delay = min(self.retry_base_sec * (2 ** attempt), 60.0)
-                    with self._metrics_lock:
-                        self._retry_count += 1
-                    time.sleep(delay)
-
-        return False
 
 
 # Global singleton instance

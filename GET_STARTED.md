@@ -43,6 +43,7 @@ Stop host **ModemManager** / **NetworkManager** before starting the container â€
 
 ```bash
 sudo systemctl stop ModemManager NetworkManager
+docker compose -f docker/docker-compose.yml down
 docker compose -f docker/docker-compose.yml up -d --build
 ```
 
@@ -68,7 +69,7 @@ docker compose -f docker/docker-compose.yml exec hiwavetel bash /app/scripts/tes
 ```
 
 
-sudo .venv/bin/python -m pytest tests/test_mqtt_client.py tests/test_external_device.py -q
+docker compose -f docker/docker-compose.yml exec hiwavetel bash -c 'cd /app/host && python -m pytest tests/ -q'
 
 docker compose -f docker/docker-compose.yml up -d --build
 docker exec -it hiwavetel bash -lc 'mmcli -L; echo MODEM_MMCLI_INDEX=$MODEM_MMCLI_INDEX; mmcli -m $MODEM_MMCLI_INDEX | head'

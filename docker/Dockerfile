@@ -29,7 +29,6 @@ RUN python3 -m venv /opt/venv \
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && python -c "import rest_framework_simplejwt" \
     && python -c "from zoneinfo import ZoneInfo; ZoneInfo('UTC')"
 
 WORKDIR /app

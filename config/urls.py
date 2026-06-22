@@ -11,10 +11,6 @@ from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularSwaggerView,
 )
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
 
 from apps.sms.views_health import health_modem_manager
 
@@ -30,13 +26,9 @@ urlpatterns = [
         'api/docs/',
         SpectacularSwaggerView.as_view(
             url_name='schema',
-            template_name_js='apps_external_device/swagger_ui_persist.js',
+            template_name_js='drf_spectacular/swagger_ui.js',
         ),
         name='swagger-ui',
     ),
-    path('api/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-    path('api/v1/', include('apps.external_device.urls')),
-    path('api/sms/device/', include('apps.external_device.device_urls')),
     path('api/', include('apps.sms.urls')),
 ]

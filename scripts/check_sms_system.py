@@ -12,9 +12,8 @@ Checks performed:
   4. D-Bus system bus accessibility
   5. Modem.Messaging D-Bus interface presence
   6. InboundSms table row count
-  7. InboxMessage table row count
-  8. Active ExternalDevice count
-  9. Signal chain: simulate _make_on_added_callback(received=True) → enqueue
+  7. Inbound webhook URLs configured
+  8. Signal chain: simulate _make_on_added_callback(received=True) → enqueue
 
 Exit code 0 = all checks passed; non-zero = at least one failure.
 """
@@ -156,34 +155,23 @@ try:
 except Exception as exc:
     fail('InboundSms query', str(exc))
 
-# ── 7. InboxMessage count ─────────────────────────────────────────────────────
-print('\n── 7. InboxMessage rows ────────────────────────────────────────')
+# ── 7. Inbound webhook URLs ───────────────────────────────────────────────────
+print('\n── 7. Inbound webhook URLs ─────────────────────────────────────')
 try:
-    from apps.external_device.models import InboxMessage
-    count = InboxMessage.objects.count()
-    if count > 0:
-        ok(f'InboxMessage table', f'{count} row(s)')
-    else:
-        warn('InboxMessage table is empty')
-except Exception as exc:
-    fail('InboxMessage query', str(exc))
+    from apps.sms.models import InboundWebhook
 
-# ── 8. Active devices ─────────────────────────────────────────────────────────
-print('\n── 8. Active ExternalDevices ───────────────────────────────────')
-try:
-    from apps.external_device.models import ExternalDevice
-    devices = list(ExternalDevice.objects.filter(status=ExternalDevice.Status.ACTIVE))
-    if devices:
-        ok(f'{len(devices)} active device(s)')
-        for d in devices:
-            info(f'  device_id={d.device_id!r} metadata={d.metadata}')
+    rows = InboundWebhook.objects.filter(enabled=True).order_by('modem_index', 'id')
+    if rows.exists():
+        ok(f'{rows.count()} enabled webhook(s) in database')
+        for row in rows:
+            info(f'  modem={row.modem_index} {row.url}')
     else:
-        warn('No active ExternalDevices — inbox mirroring will not run')
+        warn('No inbound webhooks in database — SMS will persist but not be forwarded')
 except Exception as exc:
-    fail('ExternalDevice query', str(exc))
+    fail('Webhook query', str(exc))
 
-# ── 9. Signal chain simulation ────────────────────────────────────────────────
-print('\n── 9. Signal chain: _make_on_added_callback(received=True) ─────')
+# ── 8. Signal chain simulation ────────────────────────────────────────────────
+print('\n── 8. Signal chain: _make_on_added_callback(received=True) ─────')
 try:
     from unittest.mock import MagicMock, patch
     from apps.sms.dbus_watch import _make_on_added_callback

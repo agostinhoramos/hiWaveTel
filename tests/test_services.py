@@ -141,8 +141,7 @@ def test_refresh_stale_inbound_sms_rows_fills_stuck_row():
     assert row.mm_state == 'received'
 
 
-@override_settings(MQTT_REMOTE_BRIDGE_ENABLED=False)
-def test_post_save_requeues_mirror_when_text_patched():
+def test_post_save_requeues_webhook_when_text_patched():
     path = '/org/freedesktop/ModemManager1/SMS/mirror_patch'
     InboundSms.objects.create(
         mm_path=path,
@@ -164,11 +163,12 @@ def test_post_save_requeues_mirror_when_text_patched():
 
         ip._global_processor = None
         with patch(
-            'apps.external_device.services.sync_single_inbound_to_all_devices',
-        ) as mock_sync:
+            'apps.sms.webhook_delivery.deliver_inbound_webhooks',
+            return_value=True,
+        ) as mock_deliver:
             with patch('django.db.transaction.on_commit', side_effect=lambda fn: fn()):
                 persist_inbound_sms(path, 0, client)
-        mock_sync.assert_called()
+        mock_deliver.assert_called()
 
 
 def test_dispatch_success_updates_state():

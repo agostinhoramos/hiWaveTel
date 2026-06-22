@@ -1,6 +1,6 @@
 """Tests for inbound SMS post-save processor queue."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from django.test import override_settings
@@ -26,9 +26,7 @@ def processor():
 
 
 @pytest.mark.django_db
-@override_settings(MQTT_REMOTE_BRIDGE_ENABLED=False)
-def test_process_inbound_mirror_direct(processor):
-    """Direct worker call avoids pytest transaction isolation on enqueue."""
+def test_process_inbound_delivers_webhooks(processor):
     inbound = InboundSms.objects.create(
         mm_path='/org/freedesktop/ModemManager1/SMS/test_queue_001',
         modem_index=0,
@@ -38,34 +36,32 @@ def test_process_inbound_mirror_direct(processor):
     )
 
     with patch(
-        'apps.external_device.services.sync_single_inbound_to_all_devices',
-    ) as mock_sync:
+        'apps.sms.webhook_delivery.deliver_inbound_webhooks',
+        return_value=True,
+    ) as mock_deliver:
         processor._process_inbound(inbound.pk, 'test-worker')
 
-    mock_sync.assert_called()
+    mock_deliver.assert_called_once()
     assert processor.get_metrics()['processed'] == 1
 
 
 @pytest.mark.django_db
-@override_settings(MQTT_REMOTE_BRIDGE_ENABLED=True)
-def test_process_inbound_remote_ephemeral_direct(processor):
+def test_process_inbound_webhook_failure_retries(processor):
     inbound = InboundSms.objects.create(
-        mm_path='/org/freedesktop/ModemManager1/SMS/test_remote_eph_001',
+        mm_path='/org/freedesktop/ModemManager1/SMS/test_webhook_fail',
         modem_index=0,
         from_number='+351900000098',
-        text='remote ephemeral test',
+        text='fail test',
         mm_state='received',
     )
 
     with patch(
-        'apps.external_device.services.sync_single_inbound_to_all_devices',
+        'apps.sms.webhook_delivery.deliver_inbound_webhooks',
+        return_value=False,
     ):
-        with patch(
-            'apps.external_device.services.publish_inbound_to_remote_ephemeral',
-            return_value=True,
-        ) as mock_eph:
-            processor._process_inbound(inbound.pk, 'test-worker')
-            mock_eph.assert_called()
+        processor._process_inbound(inbound.pk, 'test-worker')
+
+    assert processor.get_metrics()['failed'] >= 1
 
 
 @pytest.mark.django_db

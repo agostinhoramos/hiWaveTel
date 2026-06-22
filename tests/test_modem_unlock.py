@@ -1,44 +1,61 @@
-"""Tests for SIM PIN unlock helpers."""
+"""Verify SIM unlock only succeeds when lock clears."""
 
 from __future__ import annotations
 
-from subprocess import CompletedProcess
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from apps.sms.modem_ready import modem_overview_needs_sim_unlock, try_unlock_sim_pin
+from apps.sms.modem_ready import (
+    _mmcli_command_ok,
+    _pin_unlock_not_needed,
+    sim_pin_lock_active,
+    try_unlock_sim_pin,
+)
 
 
-def test_modem_overview_needs_sim_unlock_detects_locked():
-    overview = CompletedProcess(
-        ['mmcli', '-m', '0'],
-        0,
-        stdout='Status   |             state: locked\n           |              lock: sim-pin\n',
+def test_mmcli_command_ok_rejects_error_text_with_zero_rc():
+    cp = SimpleNamespace(returncode=0, stdout='error: no SIM was specified', stderr='')
+    assert _mmcli_command_ok(cp) is False
+
+
+def test_pin_unlock_not_needed_detects_wrong_state():
+    err = "GDBus.Error:org.freedesktop.ModemManager1.Error.Core.WrongState: Cannot send PIN: device is not SIM-PIN locked"
+    assert _pin_unlock_not_needed(err) is True
+
+
+def test_sim_pin_lock_active_uses_sim_status_not_generic_lock_lines():
+    modem_overview = SimpleNamespace(
+        returncode=0,
+        stdout='state: disabled\n  SIM: /org/freedesktop/ModemManager1/SIM/0\n  locks: sim-pin',
         stderr='',
     )
-    with patch('apps.sms.modem_ready.subprocess.run', return_value=overview):
-        assert modem_overview_needs_sim_unlock(0) is True
-
-
-def test_modem_overview_needs_sim_unlock_false_when_enabled():
-    overview = CompletedProcess(
-        ['mmcli', '-m', '0'],
-        0,
-        stdout='Status   |             state: registered\n',
+    sim_unlocked = SimpleNamespace(
+        returncode=0,
+        stdout='SIM lock status: unknown\n',
         stderr='',
     )
-    with patch('apps.sms.modem_ready.subprocess.run', return_value=overview):
-        assert modem_overview_needs_sim_unlock(0) is False
+    with patch('apps.sms.modem_ready.subprocess.run', side_effect=[modem_overview, sim_unlocked]):
+        assert sim_pin_lock_active(0) is False
 
 
-def test_try_unlock_sim_pin_uses_modem_fallback():
-    overview = CompletedProcess(
-        ['mmcli', '-m', '0'],
-        0,
-        stdout='SIM      |  primary sim path: /org/freedesktop/ModemManager1/SIM/0\n',
-        stderr='',
+def test_try_unlock_sim_pin_treats_not_pin_locked_as_success():
+    not_needed = SimpleNamespace(
+        returncode=1,
+        stdout='',
+        stderr="error: couldn't send PIN code to the SIM: device is not SIM-PIN locked",
     )
-    sim_fail = CompletedProcess(['mmcli', '-i', 'x', '--pin', '1234'], 1, stdout='', stderr='fail')
-    modem_ok = CompletedProcess(['mmcli', '-m', '0', '--pin', '1234'], 0, stdout='ok', stderr='')
+    with patch('apps.sms.modem_ready.sim_pin_lock_active', return_value=True):
+        with patch('apps.sms.modem_ready.subprocess.run', side_effect=[not_needed, not_needed]):
+            with patch('apps.sms.modem_ready.time.sleep'):
+                assert try_unlock_sim_pin(0, pin='1234') is True
 
-    with patch('apps.sms.modem_ready.subprocess.run', side_effect=[overview, sim_fail, modem_ok]):
-        assert try_unlock_sim_pin(0, pin='1234') is True
+
+def test_try_unlock_sim_pin_requires_lock_cleared():
+    locked = SimpleNamespace(returncode=0, stdout='state: locked', stderr='')
+    unlock_ok = SimpleNamespace(returncode=0, stdout='successfully sent PIN', stderr='')
+    unlocked = SimpleNamespace(returncode=0, stdout='state: enabled', stderr='')
+
+    with patch('apps.sms.modem_ready.subprocess.run', side_effect=[locked, unlock_ok, unlocked]):
+        with patch('apps.sms.modem_ready.sim_pin_lock_active', side_effect=[True, False]):
+            with patch('apps.sms.modem_ready.time.sleep'):
+                assert try_unlock_sim_pin(0, pin='1234') is True

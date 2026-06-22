@@ -1,4 +1,4 @@
-"""Thread-safe outbound SMS dispatch queue with priority and cross-process outbox drain."""
+"""Thread-safe outbound SMS dispatch queue."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from django.conf import settings
-from django.db import OperationalError, close_old_connections, transaction
+from django.db import OperationalError, close_old_connections
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,11 +40,9 @@ class OutboundProcessorQueue:
         self,
         num_workers: int = 1,
         max_queue_size: int = 10000,
-        poll_interval_sec: float = 0.1,
     ):
         self.queue: queue.PriorityQueue[_OutboundJob] = queue.PriorityQueue(maxsize=max_queue_size)
         self.num_workers = num_workers
-        self.poll_interval_sec = poll_interval_sec
         self.workers: list[threading.Thread] = []
         self.running = False
         self._stop_event = threading.Event()
@@ -71,13 +69,6 @@ class OutboundProcessorQueue:
             )
             worker.start()
             self.workers.append(worker)
-        poller = threading.Thread(
-            target=self._outbox_poll_loop,
-            name='OutboundOutboxPoller',
-            daemon=True,
-        )
-        poller.start()
-        self.workers.append(poller)
         _LOGGER.info('Outbound processor queue started with %s workers', self.num_workers)
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -139,46 +130,6 @@ class OutboundProcessorQueue:
         with self._in_flight_lock:
             self._in_flight.discard(f'{job_type}:{reference}')
 
-    def _outbox_poll_loop(self) -> None:
-        while self.running and not self._stop_event.is_set():
-            try:
-                self._drain_dispatch_outbox()
-                self._drain_mqtt_publish_outbox()
-            except Exception:
-                _LOGGER.exception('Outbound outbox poll error')
-            self._stop_event.wait(self.poll_interval_sec)
-
-    def _drain_dispatch_outbox(self) -> None:
-        from apps.external_device.models import SmsDispatchOutbox
-
-        rows = list(
-            SmsDispatchOutbox.objects.filter(dispatched_at__isnull=True)
-            .order_by('created_at')[:50]
-        )
-        for row in rows:
-            ok = self.enqueue(
-                row.job_type,
-                row.reference,
-                priority=row.priority,
-                payload=row.payload_json or {},
-            )
-            if ok:
-                row.dispatched_at = timezone_now()
-                row.save(update_fields=['dispatched_at'])
-
-    def _drain_mqtt_publish_outbox(self) -> None:
-        from apps.external_device.models import MqttPublishOutbox
-        from apps.external_device.mqtt_publish import publish_outbox_row
-
-        rows = list(
-            MqttPublishOutbox.objects.filter(published_at__isnull=True)
-            .order_by('created_at')[:50]
-        )
-        for row in rows:
-            if publish_outbox_row(row):
-                row.published_at = timezone_now()
-                row.save(update_fields=['published_at'])
-
     def _worker_loop(self) -> None:
         worker_name = threading.current_thread().name
         while self.running and not self._stop_event.is_set():
@@ -198,12 +149,8 @@ class OutboundProcessorQueue:
 
     def _process_job(self, job: _OutboundJob, worker_name: str) -> None:
         try:
-            if job.job_type == 'sms_request':
-                self._process_sms_request(job.reference, worker_name)
-            elif job.job_type == 'outbound':
+            if job.job_type == 'outbound':
                 self._process_outbound_pk(int(job.reference), worker_name)
-            elif job.job_type == 'remote':
-                self._process_remote(job.reference, job.payload, worker_name)
             else:
                 _LOGGER.warning('Unknown outbound job type=%s', job.job_type)
                 with self._metrics_lock:
@@ -212,26 +159,6 @@ class OutboundProcessorQueue:
             _LOGGER.exception('%s failed job type=%s ref=%s', worker_name, job.job_type, job.reference)
             with self._metrics_lock:
                 self._failed_count += 1
-
-    def _process_sms_request(self, request_id: str, worker_name: str) -> None:
-        from apps.external_device.models import SmsRecipientStatus, SmsRequest
-        from apps.external_device.services import _dispatch_sms_request_sync
-        from apps.sms.models import OutboundSms
-
-        sms_request = _fetch_with_sqlite_retry(
-            lambda: SmsRequest.objects.select_related('device').get(request_id=request_id)
-        )
-        if sms_request.status not in (
-            SmsRequest.Status.QUEUED,
-            SmsRequest.Status.PROCESSING,
-        ):
-            return
-        sms_request.status = SmsRequest.Status.PROCESSING
-        sms_request.save(update_fields=['status', 'updated_at'])
-        _dispatch_sms_request_sync(sms_request)
-        with self._metrics_lock:
-            self._processed_count += 1
-        _LOGGER.info('%s completed sms_request=%s', worker_name, request_id)
 
     def _process_outbound_pk(self, pk: int, worker_name: str) -> None:
         from apps.sms.models import OutboundSms
@@ -243,25 +170,7 @@ class OutboundProcessorQueue:
         dispatch_outbound_mmcli(outbound)
         with self._metrics_lock:
             self._processed_count += 1
-
-    def _process_remote(self, request_id: str, payload: dict[str, Any], worker_name: str) -> None:
-        from apps.external_device import mqtt_client as mqtt_mod
-        from apps.external_device.services import _dispatch_remote_sms_sync
-
-        remote_client = getattr(mqtt_mod, '_global_remote_client', None)
-        if remote_client is None:
-            _LOGGER.error('Remote outbound job but no _global_remote_client request_id=%s', request_id)
-            with self._metrics_lock:
-                self._failed_count += 1
-            return
-        _dispatch_remote_sms_sync(remote_client, request_id, payload)
-        with self._metrics_lock:
-            self._processed_count += 1
-
-
-def timezone_now():
-    from django.utils import timezone
-    return timezone.now()
+        _LOGGER.info('%s completed outbound pk=%s', worker_name, pk)
 
 
 def _fetch_with_sqlite_retry(fetch_fn, max_retries: int | None = None):
@@ -309,11 +218,9 @@ def get_outbound_processor() -> OutboundProcessorQueue | None:
         if num_workers <= 0:
             return None
         max_size = int(os.environ.get('OUTBOUND_PROCESSOR_MAX_SIZE', '10000'))
-        poll = float(os.environ.get('OUTBOUND_OUTBOX_POLL_SEC', '0.1'))
         _global_outbound = OutboundProcessorQueue(
             num_workers=num_workers,
             max_queue_size=max_size,
-            poll_interval_sec=poll,
         )
         _global_outbound.start()
     return _global_outbound
@@ -326,16 +233,16 @@ def enqueue_outbound_job(
     priority: str = 'normal',
     payload: dict[str, Any] | None = None,
 ) -> bool:
-    """Enqueue locally or persist to SmsDispatchOutbox for cross-process pickup."""
+    """Enqueue locally or dispatch synchronously when no worker process is active."""
     processor = get_outbound_processor()
     if processor is not None:
         return processor.enqueue(job_type, reference, priority=priority, payload=payload)
-    from apps.external_device.models import SmsDispatchOutbox
+    if job_type == 'outbound':
+        from apps.sms.models import OutboundSms
+        from apps.sms.services import dispatch_outbound_mmcli
 
-    SmsDispatchOutbox.objects.create(
-        job_type=job_type,
-        reference=reference,
-        priority=priority,
-        payload_json=dict(payload or {}),
-    )
-    return True
+        outbound = OutboundSms.objects.get(pk=int(reference))
+        dispatch_outbound_mmcli(outbound)
+        return True
+    _LOGGER.warning('enqueue_outbound_job: no processor and unsupported job_type=%s', job_type)
+    return False

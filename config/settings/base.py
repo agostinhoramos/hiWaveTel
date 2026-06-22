@@ -32,11 +32,6 @@ def validated_log_level_name(name: str, default: str = 'INFO') -> str:
     return default
 
 
-def mqtt_credential_strip(value: str) -> str:
-    """Strip whitespace and stray quotes from MQTT env vars (docker/.env tolerant)."""
-    return value.strip().strip('"').strip("'")
-
-
 def truthy_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, '').strip().lower()
     if not raw:
@@ -54,10 +49,8 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
-    'rest_framework_simplejwt',
     'drf_spectacular',
     'apps.sms',
-    'apps.external_device',
 ]
 
 MIDDLEWARE = [
@@ -156,135 +149,33 @@ try:
 except ValueError:
     HIWAVE_MMCLI_HEALTH_TIMEOUT = 15.0
 
-# MQTT settings for external device gateway (broker connection)
-MQTT_BROKER_URL = os.environ.get('MQTT_BROKER_URL', 'localhost').strip()
-MQTT_PORT = positive_int_env('MQTT_PORT', 1883)
-MQTT_USER = mqtt_credential_strip(os.environ.get('MQTT_USER', '') or '')
-MQTT_PASS = mqtt_credential_strip(os.environ.get('MQTT_PASS', '') or '')
-MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'hiwavetel_gateway').strip()
-MQTT_KEEPALIVE = positive_int_env('MQTT_KEEPALIVE', 60)
-MQTT_QOS = positive_int_env('MQTT_QOS', 1)
-MQTT_CLEAN_SESSION = os.environ.get('MQTT_CLEAN_SESSION', 'false').lower() == 'true'
-MQTT_EXTERNAL_TOPIC_PREFIX = os.environ.get('MQTT_EXTERNAL_TOPIC_PREFIX', 'hidishelink_dev').strip()
-
-# Modem/catalog MQTT subtree (hiDisheLink: MQTT_BASE_TOPIC_PREFIX). Defaults to MQTT_EXTERNAL_TOPIC_PREFIX.
-MQTT_BASE_TOPIC_PREFIX = os.environ.get('MQTT_BASE_TOPIC_PREFIX', '').strip()
-if not MQTT_BASE_TOPIC_PREFIX:
-    MQTT_BASE_TOPIC_PREFIX = MQTT_EXTERNAL_TOPIC_PREFIX
-
-# Device-topic root (hiDisheLink: MQTT_DEVICE_TOPIC_PREFIX). Empty → derive at runtime as {MQTT_BASE_TOPIC_PREFIX}/devices.
-# Django/os.environ does not expand docker-compose ${VAR}; expand one common pattern explicitly.
-_mqtt_dev_topic_raw = os.environ.get('MQTT_DEVICE_TOPIC_PREFIX', '').strip()
-_mqtt_dev_ph = '${MQTT_BASE_TOPIC_PREFIX}'
-if _mqtt_dev_topic_raw.startswith(_mqtt_dev_ph):
-    _mqtt_dev_topic_raw = MQTT_BASE_TOPIC_PREFIX.rstrip('/') + _mqtt_dev_topic_raw[len(_mqtt_dev_ph) :]
-MQTT_DEVICE_TOPIC_PREFIX = _mqtt_dev_topic_raw
-
-MQTT_PUBLISH_SEND_REQUEST = truthy_env('MQTT_PUBLISH_SEND_REQUEST', default=True)
-MQTT_PUBLISH_MODEM_INBOX = truthy_env('MQTT_PUBLISH_MODEM_INBOX', default=False)
-_ephemeral_publish_timeout_raw = os.environ.get('MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC', '').strip()
+# Inbound SMS webhook delivery (apps/sms/webhook_delivery.py)
+_webhook_timeout_raw = os.environ.get('SMS_WEBHOOK_TIMEOUT_SEC', '').strip()
 try:
-    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = (
-        float(_ephemeral_publish_timeout_raw) if _ephemeral_publish_timeout_raw else 15.0
+    SMS_WEBHOOK_TIMEOUT_SEC = float(_webhook_timeout_raw) if _webhook_timeout_raw else 15.0
+except ValueError:
+    SMS_WEBHOOK_TIMEOUT_SEC = 15.0
+SMS_WEBHOOK_RETRY_MAX = positive_int_env('SMS_WEBHOOK_RETRY_MAX', 5)
+if SMS_WEBHOOK_RETRY_MAX <= 0:
+    SMS_WEBHOOK_RETRY_MAX = 5
+_webhook_retry_base_raw = os.environ.get('SMS_WEBHOOK_RETRY_BASE_SEC', '1.0').strip()
+try:
+    SMS_WEBHOOK_RETRY_BASE_SEC = float(_webhook_retry_base_raw) if _webhook_retry_base_raw else 1.0
+except ValueError:
+    SMS_WEBHOOK_RETRY_BASE_SEC = 1.0
+
+# Container restart API (apps/sms/container_restart.py)
+HIWAVE_ALLOW_CONTAINER_RESTART_API = truthy_env('HIWAVE_ALLOW_CONTAINER_RESTART_API', default=True)
+_container_restart_delay_raw = os.environ.get('HIWAVE_CONTAINER_RESTART_DELAY_SEC', '1.0').strip()
+try:
+    HIWAVE_CONTAINER_RESTART_DELAY_SEC = (
+        float(_container_restart_delay_raw) if _container_restart_delay_raw else 1.0
     )
 except ValueError:
-    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = 15.0
-if MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC <= 0:
-    MQTT_EPHEMERAL_PUBLISH_TIMEOUT_SEC = 15.0
+    HIWAVE_CONTAINER_RESTART_DELAY_SEC = 1.0
 
-_mqtt_modem_inbox_mode_raw = os.environ.get('MQTT_MODEM_INBOX_DELIVERY_MODE', 'broadcast').strip().lower()
-MQTT_MODEM_INBOX_DELIVERY_MODE = 'per_device' if _mqtt_modem_inbox_mode_raw == 'per_device' else 'broadcast'
-MQTT_MODEM_STATUS_SUBSCRIBE = truthy_env('MQTT_MODEM_STATUS_SUBSCRIBE', default=True)
-_modem_status_timeout_raw = os.environ.get('MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC', '').strip()
-try:
-    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = (
-        float(_modem_status_timeout_raw) if _modem_status_timeout_raw else 45.0
-    )
-except ValueError:
-    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = 45.0
-if MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC <= 0:
-    MQTT_MODEM_STATUS_COMMAND_TIMEOUT_SEC = 45.0
-
-MQTT_MODEM_STATUS_AUTO_PUBLISH = truthy_env('MQTT_MODEM_STATUS_AUTO_PUBLISH', default=True)
-_modem_status_poll_interval_raw = os.environ.get('MQTT_MODEM_STATUS_POLL_INTERVAL_SEC', '').strip()
-try:
-    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = (
-        float(_modem_status_poll_interval_raw) if _modem_status_poll_interval_raw else 30.0
-    )
-except ValueError:
-    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
-if MQTT_MODEM_STATUS_POLL_INTERVAL_SEC < 0:
-    MQTT_MODEM_STATUS_POLL_INTERVAL_SEC = 30.0
-
-MQTT_SUBSCRIBE_MODEM_CATALOG = truthy_env('MQTT_SUBSCRIBE_MODEM_CATALOG', default=True)
-# Whether the gateway subscribes to the health/ping wildcard at all (telemetry + pong handling).
-# Independent of MQTT_HEALTH_AUTO_PONG: disabling subscription stops telemetry persistence too.
-MQTT_HEALTH_PING_SUBSCRIBE = truthy_env('MQTT_HEALTH_PING_SUBSCRIBE', default=True)
-MQTT_HEALTH_AUTO_PONG = truthy_env('MQTT_HEALTH_AUTO_PONG', default=True)
-MQTT_HEALTH_PING_SUBSCRIBE_QOS = positive_int_env('MQTT_HEALTH_PING_SUBSCRIBE_QOS', 0)
-if MQTT_HEALTH_PING_SUBSCRIBE_QOS > 2:
-    MQTT_HEALTH_PING_SUBSCRIBE_QOS = 0
-MQTT_HEALTH_SUBSCRIBE_PONG = truthy_env('MQTT_HEALTH_SUBSCRIBE_PONG', default=True)
-
-# run_mqtt_gateway: publish tipo B health/ping (source=django) for each active ExternalDevice on this interval (0 = off)
-_mqtt_srv_ping_interval_raw = os.environ.get('MQTT_HEALTH_SERVER_PING_INTERVAL_SEC', '60').strip()
-try:
-    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = (
-        float(_mqtt_srv_ping_interval_raw) if _mqtt_srv_ping_interval_raw else 60.0
-    )
-except ValueError:
-    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = 0.0
-if MQTT_HEALTH_SERVER_PING_INTERVAL_SEC < 0:
-    MQTT_HEALTH_SERVER_PING_INTERVAL_SEC = 0.0
-
-MQTT_SEND_RECIPIENTS_CHUNK_SIZE = positive_int_env('MQTT_SEND_RECIPIENTS_CHUNK_SIZE', 50)
-if MQTT_SEND_RECIPIENTS_CHUNK_SIZE <= 0:
-    MQTT_SEND_RECIPIENTS_CHUNK_SIZE = 50
-
-# Remote hiDisheLink REST (admin integration — fetch MQTT config, device onboarding)
-HIDISHELINK_API_URL = os.environ.get('HIDISHELINK_API_URL', 'http://192.168.1.77:5201').strip().rstrip('/')
-HIDISHELINK_API_TIMEOUT_SEC = positive_int_env('HIDISHELINK_API_TIMEOUT_SEC', 30)
-if HIDISHELINK_API_TIMEOUT_SEC <= 0:
-    HIDISHELINK_API_TIMEOUT_SEC = 30
-
-# Android `/api/sms/device/` session TTL (login + refresh)
-HIDISHELINK_SESSION_TTL_HOURS = positive_int_env('HIDISHELINK_SESSION_TTL_HOURS', 24)
-if HIDISHELINK_SESSION_TTL_HOURS <= 0:
-    HIDISHELINK_SESSION_TTL_HOURS = 24
-
-# Optional jitter fraction for mqtt-config map (sec. 5 client contract)
-_raw_jitter = os.environ.get('MQTT_RECONNECT_JITTER', '0.2').strip()
-try:
-    MQTT_RECONNECT_JITTER = float(_raw_jitter) if _raw_jitter else 0.2
-except ValueError:
-    MQTT_RECONNECT_JITTER = 0.2
-
-# Optional extra / legacy toggle; django tipo B pings also honor MQTT_HEALTH_AUTO_PONG above.
-MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO = truthy_env('MQTT_HEALTH_GATEWAY_AUTO_PONG_DJANGO', default=False)
-
-# Default SMS inbox flag exposed to Android mqtt-config (`SMS_INBOX_ENABLED`)
-SMS_INBOX_ENABLED_DEFAULT = truthy_env('SMS_INBOX_ENABLED_DEFAULT', default=True)
-
-# Remote hiDisheLink bridge mode settings
-MQTT_REMOTE_BRIDGE_ENABLED = truthy_env('MQTT_REMOTE_BRIDGE_ENABLED', default=True)
-MQTT_LOCAL_BROKER_ENABLED = truthy_env('MQTT_LOCAL_BROKER_ENABLED', default=True)
-
-# Remote client device_id (from HiDishelinkDevice or env)
-MQTT_REMOTE_DEVICE_ID = os.environ.get('MQTT_REMOTE_DEVICE_ID', '').strip()
-
-# Health heartbeat interval (s) for remote broker (tipo A telemetry without source:django)
-MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = positive_int_env('MQTT_REMOTE_HEALTH_HEARTBEAT_SEC', 60)
-if MQTT_REMOTE_HEALTH_HEARTBEAT_SEC <= 0:
-    MQTT_REMOTE_HEALTH_HEARTBEAT_SEC = 60
-
-# Gateway startup: fetch mqtt-config from remote API or use cached snapshot
-MQTT_CONFIG_STARTUP_REFRESH = truthy_env('MQTT_CONFIG_STARTUP_REFRESH', default=False)
-
-# SMS storage rotation (apps/external_device/management/commands/cleanup_sms_storage.py)
+# SMS storage rotation (management command cleanup_sms_storage)
 SMS_STORAGE_ROTATION_ENABLED = truthy_env('SMS_STORAGE_ROTATION_ENABLED', default=True)
-SMS_MAX_MESSAGES_PER_DEVICE = positive_int_env('SMS_MAX_MESSAGES_PER_DEVICE', 1000)
-if SMS_MAX_MESSAGES_PER_DEVICE <= 0:
-    SMS_MAX_MESSAGES_PER_DEVICE = 1000
 SMS_MAX_MESSAGES_PER_MODEM = positive_int_env('SMS_MAX_MESSAGES_PER_MODEM', 2000)
 if SMS_MAX_MESSAGES_PER_MODEM <= 0:
     SMS_MAX_MESSAGES_PER_MODEM = 2000
@@ -313,7 +204,6 @@ if MMCLI_RECEIVING_MAX_WAIT_SEC <= 0:
     MMCLI_RECEIVING_MAX_WAIT_SEC = 60
 
 # Inbound SMS post-save processor queue (apps/sms/inbound_processor.py)
-# Async processing of InboundSms mirror + MQTT publish with retry logic
 INBOUND_PROCESSOR_WORKERS = positive_int_env('INBOUND_PROCESSOR_WORKERS', 2)
 INBOUND_PROCESSOR_MAX_SIZE = positive_int_env('INBOUND_PROCESSOR_MAX_SIZE', 500)
 INBOUND_PROCESSOR_RETRY_MAX = positive_int_env('INBOUND_PROCESSOR_RETRY_MAX', 5)
@@ -335,68 +225,28 @@ try:
 except ValueError:
     OUTBOUND_OUTBOX_POLL_SEC = 0.1
 
-# MQTT handler offload queue (apps/external_device/mqtt_handler_queue.py)
-MQTT_HANDLER_QUEUE_ENABLED = truthy_env('MQTT_HANDLER_QUEUE_ENABLED', default=True)
-MQTT_HANDLER_WORKERS = positive_int_env('MQTT_HANDLER_WORKERS', 3)
-MQTT_HANDLER_MAX_SIZE = positive_int_env('MQTT_HANDLER_MAX_SIZE', 5000)
-MQTT_HANDLER_LOAD_SHED_THRESHOLD = positive_int_env('MQTT_HANDLER_LOAD_SHED_THRESHOLD', 100)
-MQTT_LOAD_SHED_HEALTH = truthy_env('MQTT_LOAD_SHED_HEALTH', default=True)
-MQTT_PERSISTENT_PUBLISH = truthy_env('MQTT_PERSISTENT_PUBLISH', default=True)
-
-# MQTT client tuning (mirrors hiDisheLink mqtt-config; optional fallbacks when no remote config)
-MQTT_AUTO_RECONNECT = truthy_env('MQTT_AUTO_RECONNECT', default=True)
-MQTT_CONNECTION_TIMEOUT = positive_int_env('MQTT_CONNECTION_TIMEOUT', 30)
-MQTT_RECONNECT_INITIAL_DELAY_MS = positive_int_env('MQTT_RECONNECT_INITIAL_DELAY_MS', 1000)
-MQTT_RECONNECT_MAX_DELAY_MS = positive_int_env('MQTT_RECONNECT_MAX_DELAY_MS', 30000)
-_raw_bm = os.environ.get('MQTT_RECONNECT_BACKOFF_MULTIPLIER', '2').strip()
-try:
-    MQTT_RECONNECT_BACKOFF_MULTIPLIER = float(_raw_bm) if _raw_bm else 2.0
-except ValueError:
-    MQTT_RECONNECT_BACKOFF_MULTIPLIER = 2.0
-MQTT_RECONNECT_MAX_RETRIES = positive_int_env('MQTT_RECONNECT_MAX_RETRIES', 0)
-MQTT_CONNECTION_WATCHDOG_INTERVAL_MS = positive_int_env('MQTT_CONNECTION_WATCHDOG_INTERVAL_MS', 0)
-
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
+        'rest_framework.permissions.AllowAny',
     ],
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
-    ),
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 50,
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
-    ],
-    'DEFAULT_THROTTLE_RATES': {
-        'anon': os.environ.get('DRF_THROTTLE_ANON_RATE', '100/day'),
-        'user': os.environ.get('DRF_THROTTLE_USER_RATE', '1000/day'),
-    },
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
 }
 
 SPECTACULAR_SETTINGS = {
     'TITLE': 'hiWaveTel API',
     'DESCRIPTION': (
-        'SMS via ModemManager (mmcli); inbound persisted by D-Bus watcher.\n\n'
-        '- **Modem API** (`/api/sms/…`): JWT from `/api/auth/token/` — in Swagger authorize '
-        'scheme **jwtAuth** (Bearer).\n'
-        '- **External devices** (`/api/v1/…`): API key — in Swagger authorize scheme '
-        '**apiKeyAuth** (header `X-API-Key`). Bearer JWT is not accepted on these routes.\n\n'
-        'OpenAPI `/api/schema/` and Swagger UI `/api/docs/` are public; try endpoints still '
-        'require the correct auth per route.'
+        'SMS gateway via ModemManager (mmcli).\n\n'
+        '- **Send SMS:** `POST /api/sms/send/` — no authentication.\n'
+        '- **Modems:** `GET/PUT /api/sms/modems/{id}/`, `POST /api/sms/modems/sync/`.\n'
+        '- **Inbound SMS:** delivered to HTTP webhooks registered per modem.\n'
+        '- **System:** `GET /api/health/`, availability probe, `POST /api/sms/system/container/restart/`.\n\n'
+        'Configure inbound webhooks via API or Django Admin → Inbound webhooks.'
     ),
-    'VERSION': '1.0.0',
-    # Do not set SECURITY globally: it was appended to every operation and forced Bearer on
-    # `/api/v1/*` while the server expects X-API-Key. Per-endpoint security comes from auth
-    # classes (jwtAuth / apiKeyAuth via OpenApiAuthenticationExtension).
+    'VERSION': '2.0.0',
     'SECURITY': [],
     'SWAGGER_UI_SETTINGS': {
         'deepLinking': True,
-        # Keep Authorize dialog values after refresh (localStorage).
-        'persistAuthorization': True,
     },
 }
 
@@ -469,4 +319,3 @@ LOGGING = {
     },
 }
 
-SIMPLE_JWT = {}

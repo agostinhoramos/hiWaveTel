@@ -2,7 +2,7 @@ from django.conf import settings
 from django.contrib import admin, messages
 from django.utils.html import format_html
 
-from .models import InboundSms, OutboundSms
+from .models import InboundSms, InboundWebhook, ModemDevice, OutboundSms
 from .services import persist_inbound_sms
 
 
@@ -76,8 +76,18 @@ class OutboundSmsAdmin(admin.ModelAdmin):
         modem_limit = getattr(settings, 'SMS_MAX_MESSAGES_PER_MODEM', 2000)
         per_type = max(1, modem_limit // 2)
         total = OutboundSms.objects.count()
-        extra_context['sms_modem_storage_note'] = (
-            f'Total OutboundSms: {total}. Rotation limit per modem_index: {per_type} '
-            f'(SMS_MAX_MESSAGES_PER_MODEM={modem_limit}).'
-        )
         return super().changelist_view(request, extra_context=extra_context)
+
+
+@admin.register(ModemDevice)
+class ModemDeviceAdmin(admin.ModelAdmin):
+    list_display = ('modem_index', 'enabled', 'is_present', 'dbus_path', 'last_detected_at')
+    list_filter = ('enabled', 'is_present')
+    readonly_fields = ('first_detected_at', 'last_detected_at')
+
+
+@admin.register(InboundWebhook)
+class InboundWebhookAdmin(admin.ModelAdmin):
+    list_display = ('name', 'modem_index', 'url', 'enabled', 'created_at')
+    list_filter = ('enabled', 'modem_index')
+    search_fields = ('name', 'url')

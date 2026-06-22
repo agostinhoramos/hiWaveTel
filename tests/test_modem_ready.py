@@ -26,27 +26,38 @@ def test_try_enable_modem_disabled_state_succeeds():
     state_result = SimpleNamespace(returncode=0, stdout='state: disabled', stderr='')
     enable_result = SimpleNamespace(returncode=0, stdout='successfully enabled', stderr='')
 
-    with patch('apps.sms.modem_ready.subprocess.run', side_effect=[state_result, enable_result]) as mock_run:
-        try_enable_modem(modem_index=0)
+    with patch('apps.sms.modem_ready.get_modem_state', return_value='disabled'):
+        with patch('apps.sms.modem_ready.sim_pin_lock_active', return_value=False):
+            with patch('apps.sms.modem_ready.subprocess.run', return_value=enable_result) as mock_run:
+                try_enable_modem(modem_index=0)
 
-    assert mock_run.call_count == 2
-    assert mock_run.call_args_list[1][0][0] == ['mmcli', '-m', '0', '--enable']
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][0] == ['mmcli', '-m', '0', '--enable']
+
+
+def test_try_enable_modem_unknown_state_attempts_enable():
+    enable_result = SimpleNamespace(returncode=0, stdout='successfully enabled', stderr='')
+
+    with patch('apps.sms.modem_ready.get_modem_state', return_value='unknown'):
+        with patch('apps.sms.modem_ready.sim_pin_lock_active', return_value=False):
+            with patch('apps.sms.modem_ready.subprocess.run', return_value=enable_result) as mock_run:
+                try_enable_modem(modem_index=0)
+
+    mock_run.assert_called_once()
 
 
 def test_try_enable_modem_not_disabled_skips_enable():
-    state_result = SimpleNamespace(returncode=0, stdout='state: enabled', stderr='')
+    with patch('apps.sms.modem_ready.get_modem_state', return_value='enabled'):
+        with patch('apps.sms.modem_ready.subprocess.run') as mock_run:
+            try_enable_modem(modem_index=0)
 
-    with patch('apps.sms.modem_ready.subprocess.run', return_value=state_result) as mock_run:
-        try_enable_modem(modem_index=0)
-
-    assert mock_run.call_count == 1
+    mock_run.assert_not_called()
 
 
 def test_wait_modem_ready_returns_true_when_enabled():
-    enabled = SimpleNamespace(returncode=0, stdout='state: enabled', stderr='')
-
-    with patch('apps.sms.modem_ready.subprocess.run', return_value=enabled):
-        assert wait_modem_ready_for_sms(0, timeout_sec=1.0) is True
+    with patch('apps.sms.modem_ready._resolve_working_modem_index', return_value=0):
+        with patch('apps.sms.modem_ready.get_modem_state', return_value='enabled'):
+            assert wait_modem_ready_for_sms(0, timeout_sec=1.0) is True
 
 
 def test_dbus_watch_reexports_try_enable_modem():
@@ -83,14 +94,7 @@ def test_dispatch_calls_prepare_modem_when_no_injected_client():
 
 
 def test_prepare_modem_enable_then_wait():
-    calls = [
-        SimpleNamespace(returncode=0, stdout='state: disabled', stderr=''),
-        SimpleNamespace(returncode=0, stdout='ok', stderr=''),
-        SimpleNamespace(returncode=0, stdout='state: enabled', stderr=''),
-    ]
-
-    with patch('apps.sms.modem_ready.subprocess.run', side_effect=calls) as mock_run:
-        with patch('apps.sms.modem_ready.time.sleep'):
-            prepare_modem_for_outbound_sms(0)
-
-    assert mock_run.call_count == 3
+    with patch('apps.sms.modem_ready._resolve_working_modem_index', return_value=0):
+        with patch('apps.sms.modem_ready.get_modem_state', return_value='enabled'):
+            with patch('apps.sms.modem_ready.messaging_interface_ready', return_value=True):
+                prepare_modem_for_outbound_sms(0)

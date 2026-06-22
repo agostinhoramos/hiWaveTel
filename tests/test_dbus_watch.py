@@ -123,14 +123,13 @@ def test_try_enable_modem_disabled_state_succeeds():
         stderr=''
     )
     
-    with patch('subprocess.run', side_effect=[state_result, enable_result]) as mock_run:
-        dbus_watch._try_enable_modem(modem_index=0)
-    
-    assert mock_run.call_count == 2
-    # First call checks state
-    assert mock_run.call_args_list[0][0][0] == ['mmcli', '-m', '0']
-    # Second call enables
-    assert mock_run.call_args_list[1][0][0] == ['mmcli', '-m', '0', '--enable']
+    with patch('apps.sms.modem_ready.get_modem_state', return_value='disabled'):
+        with patch('apps.sms.modem_ready.sim_pin_lock_active', return_value=False):
+            with patch('apps.sms.modem_ready.subprocess.run', return_value=enable_result) as mock_run:
+                dbus_watch._try_enable_modem(modem_index=0)
+
+    mock_run.assert_called_once()
+    assert mock_run.call_args[0][0] == ['mmcli', '-m', '0', '--enable']
 
 
 def test_try_enable_modem_disabled_state_enable_fails():
@@ -146,11 +145,12 @@ def test_try_enable_modem_disabled_state_enable_fails():
         stderr='enable failed: error'
     )
     
-    with patch('subprocess.run', side_effect=[state_result, enable_result]) as mock_run:
-        # Should not raise exception
-        dbus_watch._try_enable_modem(modem_index=0)
-    
-    assert mock_run.call_count == 2
+    with patch('apps.sms.modem_ready.get_modem_state', return_value='disabled'):
+        with patch('apps.sms.modem_ready.sim_pin_lock_active', return_value=False):
+            with patch('apps.sms.modem_ready.subprocess.run', return_value=enable_result) as mock_run:
+                dbus_watch._try_enable_modem(modem_index=0)
+
+    mock_run.assert_called_once()
 
 
 def test_try_enable_modem_not_disabled():

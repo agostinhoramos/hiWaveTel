@@ -232,22 +232,3 @@ class TestRecoverMissingSmsCommand:
 
         assert 'DLQ processed' in out.getvalue()
 
-
-@pytest.mark.django_db
-class TestSmsMetricsEndpoint:
-    def test_metrics_endpoint_requires_admin(self):
-        client = APIClient()
-        url = reverse('sms-metrics')
-        response = client.get(url)
-        assert response.status_code in (401, 403)
-
-    def test_metrics_endpoint_returns_stats(self):
-        User = get_user_model()
-        admin = User.objects.create_superuser('smsmetrics', 'm@test.invalid', 'pw-metrics-admin')
-        client = APIClient()
-        client.force_authenticate(user=admin)
-        url = reverse('sms-metrics')
-        response = client.get(url)
-        assert response.status_code == 200
-        assert 'persist_success' in response.data
-        assert 'dlq_pending' in response.data

@@ -409,6 +409,17 @@ def dispatch_outbound_mmcli(outbound: OutboundSms, *, client: MMCLIClient | None
             outbound.error_message = format_public_mmcli_error(exc)
             outbound.save(update_fields=('state', 'error_message'))
             _LOGGER.warning('Outbound id=%s failed: %s', outbound.pk, exc)
+            from .modem_readiness import ReadinessIssue, refresh_readiness_safe
+
+            refresh_readiness_safe(
+                outbound.modem_index,
+                extra_issues=[
+                    ReadinessIssue(
+                        code='outbound_failed_recently',
+                        message=outbound.error_message or 'Outbound SMS dispatch failed.',
+                    ),
+                ],
+            )
             return outbound
 
 
