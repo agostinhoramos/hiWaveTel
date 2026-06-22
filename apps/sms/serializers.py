@@ -172,3 +172,17 @@ class InboundWebhookCreateSerializer(serializers.Serializer):
         if normalized != (value or '').strip():
             return normalized
         return value
+
+
+class InboundWebhookUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=128, required=False)
+    url = serializers.URLField(max_length=512, required=False)
+    enabled = serializers.BooleanField(required=False)
+
+    def validate_url(self, value: str) -> str:
+        from apps.sms.webhook_delivery import normalize_webhook_url
+
+        normalized = normalize_webhook_url(value)
+        if normalized != (value or '').strip():
+            return normalized
+        return value

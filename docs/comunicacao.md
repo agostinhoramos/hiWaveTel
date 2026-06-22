@@ -18,6 +18,7 @@ Referência OpenAPI: `GET /api/schema/` · Swagger UI: `GET /api/docs/`
 | `POST /api/sms/modems/sync/` | Cliente → hiWaveTel | Re-detectar modems (mmcli -L) |
 | `GET /api/sms/webhooks/` | Cliente → hiWaveTel | Listar webhooks |
 | `POST /api/sms/modems/{id}/webhooks/` | Cliente → hiWaveTel | Registar webhook por modem |
+| `GET/PUT/PATCH/DELETE /api/sms/modems/{id}/webhooks/{webhook_id}/` | Cliente → hiWaveTel | Consultar / editar / apagar webhook |
 | `POST /api/sms/system/container/restart/` | Cliente → hiWaveTel | Reiniciar container |
 
 Processos em segundo plano (Docker `RUN_SMS_WATCHER=true`):
@@ -142,6 +143,34 @@ Lista todos os webhooks (`id`, `modem_index`, `name`, `url`, `enabled`, `created
 **404** se o índice não estiver enumerado pelo ModemManager.
 
 Use o **URL de endpoint** do destino (ex.: `https://webhook.site/{uuid}`), não a página de edição do browser (`#!/edit/...`). O gateway normaliza automaticamente URLs webhook.site mal copiadas.
+
+### `GET /api/sms/modems/{modem_index}/webhooks/{webhook_id}/`
+
+Detalhe de um webhook do modem.
+
+### `PUT /api/sms/modems/{modem_index}/webhooks/{webhook_id}/`
+
+Actualiza `name`, `url` e/ou `enabled` (envie pelo menos um campo):
+
+```json
+{
+  "name": "app-principal",
+  "url": "https://webhook.site/e6138d12-ca64-4caa-ae32-fd304cdc063d",
+  "enabled": true
+}
+```
+
+**404** se o webhook não existir ou não pertencer ao `modem_index`.
+
+### `PATCH /api/sms/modems/{modem_index}/webhooks/{webhook_id}/`
+
+Actualização parcial (ex.: só `enabled` ou só `url`).
+
+### `DELETE /api/sms/modems/{modem_index}/webhooks/{webhook_id}/`
+
+Remove o webhook. Resposta **204 No Content** em sucesso.
+
+**404** se o webhook não existir ou não pertencer ao `modem_index`.
 
 ### Payload entregue ao destino
 
