@@ -23,33 +23,6 @@ _SIM_PIN_ACTIVE_RE = re.compile(
 _MODEM_STATUS_SIM_PIN_LOCK_RE = re.compile(r'\block:\s*sim-pin\b', re.IGNORECASE)
 
 
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str) -> None:
-    # #region agent log
-    import json
-
-    payload = {
-        'sessionId': 'da0c52',
-        'timestamp': int(time.time() * 1000),
-        'location': location,
-        'message': message,
-        'data': data,
-        'hypothesisId': hypothesis_id,
-    }
-    line = json.dumps(payload, default=str) + '\n'
-    for log_path in (
-        '/home/webmaster/www/public/hiWaveTel/.cursor/debug-da0c52.log',
-        '/app/host/.cursor/debug-da0c52.log',
-    ):
-        try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, 'a', encoding='utf-8') as fh:
-                fh.write(line)
-            break
-        except OSError:
-            continue
-    # #endregion
-
-
 def _modem_overview_reports_sim_pin_lock(haystack: str) -> bool:
     return bool(_MODEM_STATUS_SIM_PIN_LOCK_RE.search(haystack or ''))
 
@@ -100,23 +73,7 @@ def sim_pin_lock_active(modem_index: int, *, mmcli_path: str | None = None) -> b
     overview_pin_lock = _modem_overview_reports_sim_pin_lock(haystack)
     sim_path = _extract_sim_path_from_modem_overview(haystack)
     sim_pin_lock = _sim_path_needs_pin_unlock(sim_path, mmcli_path=path) if sim_path else False
-    result = overview_pin_lock or sim_pin_lock or (state == 'locked' and not sim_path)
-    # #region agent log
-    _agent_debug_log(
-        'modem_ready.py:sim_pin_lock_active',
-        'sim pin lock evaluation',
-        {
-            'modem_index': modem_index,
-            'state': state,
-            'overview_pin_lock': overview_pin_lock,
-            'sim_path': sim_path,
-            'sim_pin_lock': sim_pin_lock,
-            'result': result,
-        },
-        'A',
-    )
-    # #endregion
-    return result
+    return overview_pin_lock or sim_pin_lock or (state == 'locked' and not sim_path)
 
 
 def modem_overview_needs_sim_unlock(modem_index: int, *, mmcli_path: str | None = None) -> bool:
@@ -187,14 +144,6 @@ def try_unlock_sim_pin(modem_index: int, *, pin: str | None = None, mmcli_path: 
         state = get_modem_state(modem_index, mmcli_path=path)
         if not pin_lock_active:
             if state in _READY_STATES or state not in ('locked',):
-                # #region agent log
-                _agent_debug_log(
-                    'modem_ready.py:try_unlock_sim_pin',
-                    'unlock skipped — no active SIM-PIN lock',
-                    {'modem_index': modem_index, 'state': state, 'attempt': attempt},
-                    'B',
-                )
-                # #endregion
                 return True
             _LOGGER.info(
                 'Modem %s still locked (state=%s) without SIM-PIN flag; attempting PIN unlock',

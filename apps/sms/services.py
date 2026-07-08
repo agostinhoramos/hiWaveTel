@@ -394,19 +394,6 @@ def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, 
         'still_stale': 0,
         'marked_unavailable': 0,
     }
-    # #region agent log
-    try:
-        from apps.sms.modem_ready import _agent_debug_log
-
-        _agent_debug_log(
-            'services.py:refresh_stale_inbound_sms_rows',
-            'stale refresh batch start',
-            {'modem_index': modem_index, 'candidate_count': qs.count()},
-            'E',
-        )
-    except Exception:
-        pass
-    # #endregion
     for row in qs.order_by('pk').iterator(chunk_size=100):
         stats['checked'] += 1
         before_text = (row.text or '').strip()
