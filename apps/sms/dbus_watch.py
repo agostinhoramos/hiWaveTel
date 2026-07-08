@@ -210,14 +210,40 @@ async def run_modem_added_listener(
             await asyncio.sleep(reconnect_after)
             continue
 
+        # #region agent log
+        from apps.sms.modem_ready import _agent_debug_log
+
+        _agent_debug_log(
+            'dbus_watch.py:run_modem_added_listener',
+            'resolved modem index before ensure',
+            {'configured_index': configured_index, 'resolved_index': modem_index},
+            'D',
+        )
+        # #endregion
+
         path = modem_object_path(modem_index)
         bus: MessageBus | None = None
         try:
             # Wait for modem + Messaging before D-Bus subscribe (handles unknown/failed/reprobe).
             await loop.run_in_executor(
                 None,
-                lambda: ensure_modem_ready_for_sms(modem_index, require_messaging=True),
+                lambda idx=modem_index: ensure_modem_ready_for_sms(idx, require_messaging=True),
             )
+
+            modem_index = await loop.run_in_executor(
+                None,
+                lambda: resolve_modem_mmcli_index(configured_index),
+            )
+            path = modem_object_path(modem_index)
+
+            # #region agent log
+            _agent_debug_log(
+                'dbus_watch.py:run_modem_added_listener',
+                'resolved modem index after ensure',
+                {'configured_index': configured_index, 'resolved_index': modem_index, 'dbus_path': path},
+                'D',
+            )
+            # #endregion
 
             bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
             

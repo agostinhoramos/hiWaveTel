@@ -54,7 +54,21 @@ def test_resolve_modem_mmcli_index_uses_configured_when_present():
 
     client = MMCLIClient()
     with patch.object(MMCLIClient, 'list_modem_indices', return_value=[0, 1]):
-        assert resolve_modem_mmcli_index(1, client=client) == 1
+        with patch('apps.sms.modem_ready.get_modem_state', return_value='registered'):
+            assert resolve_modem_mmcli_index(1, client=client) == 1
+
+
+def test_resolve_modem_mmcli_index_prefers_ready_modem_when_configured_locked():
+    from apps.sms.mmcli_client import resolve_modem_mmcli_index
+
+    client = MMCLIClient()
+
+    def _state(idx: int, **kwargs) -> str:
+        return 'locked' if idx == 0 else 'registered'
+
+    with patch.object(MMCLIClient, 'list_modem_indices', return_value=[0, 1]):
+        with patch('apps.sms.modem_ready.get_modem_state', side_effect=_state):
+            assert resolve_modem_mmcli_index(0, client=client) == 1
 
 
 def test_resolve_modem_mmcli_index_falls_back_to_primary():
@@ -62,8 +76,9 @@ def test_resolve_modem_mmcli_index_falls_back_to_primary():
 
     client = MMCLIClient()
     with patch.object(MMCLIClient, 'list_modem_indices', return_value=[1]):
-        with patch.object(MMCLIClient, 'primary_modem_index', return_value=1):
-            assert resolve_modem_mmcli_index(0, client=client) == 1
+        with patch('apps.sms.modem_ready.get_modem_state', return_value='registered'):
+            with patch.object(MMCLIClient, 'primary_modem_index', return_value=1):
+                assert resolve_modem_mmcli_index(0, client=client) == 1
 
 
 def test_list_sms_paths_parses():

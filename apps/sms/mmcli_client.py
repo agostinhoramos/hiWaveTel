@@ -280,17 +280,37 @@ def resolve_modem_mmcli_index(
     """
     from django.conf import settings
 
+    from apps.sms.modem_ready import get_modem_state
+
     mm = client or MMCLIClient()
     want = int(configured if configured is not None else getattr(settings, 'MODEM_MMCLI_INDEX', 0))
     present = mm.list_modem_indices()
-    if want in present:
-        return want
     if not present:
         raise MmcliError(
             f'Modem index {want} not found and mmcli -L lists no modems',
             stderr='no modems',
             exit_code=-2,
         )
+
+    def _ready(idx: int) -> bool:
+        return get_modem_state(idx, mmcli_path=mm.mmcli_path) in {'enabled', 'registered'}
+
+    if want in present and _ready(want):
+        return want
+
+    for idx in sorted(present):
+        if idx != want and _ready(idx):
+            _LOGGER.warning(
+                'MODEM_MMCLI_INDEX=%s not ready (present=%s); using ready modem %s',
+                want,
+                present,
+                idx,
+            )
+            return idx
+
+    if want in present:
+        return want
+
     fallback = mm.primary_modem_index()
     _LOGGER.warning(
         'MODEM_MMCLI_INDEX=%s not in mmcli -L (present=%s); using primary modem %s',

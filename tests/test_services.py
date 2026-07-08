@@ -141,6 +141,47 @@ def test_refresh_stale_inbound_sms_rows_fills_stuck_row():
     assert row.mm_state == 'received'
 
 
+def test_refresh_stale_skips_rows_with_text_and_blank_mm_state():
+    path = '/org/freedesktop/ModemManager1/SMS/already_ok'
+    InboundSms.objects.create(
+        mm_path=path,
+        modem_index=0,
+        from_number='+351900000001',
+        text='already stored',
+        mm_state='',
+    )
+    client = MMCLIClient()
+    client.show_sms = MagicMock()
+    with patch('apps.sms.services.MMCLIClient', return_value=client):
+        stats = refresh_stale_inbound_sms_rows(modem_index=0)
+    assert stats['checked'] == 0
+    client.show_sms.assert_not_called()
+
+
+def test_refresh_stale_marks_missing_modem_sms_unavailable():
+    path = '/org/freedesktop/ModemManager1/SMS/gone1'
+    InboundSms.objects.create(
+        mm_path=path,
+        modem_index=0,
+        from_number='',
+        text='',
+        mm_state='',
+    )
+    client = MMCLIClient()
+    client.show_sms = MagicMock(
+        side_effect=MmcliError(
+            "couldn't find SMS at '/org/freedesktop/ModemManager1/SMS/gone1'",
+            stderr="not found in any modem",
+        ),
+    )
+    with patch('apps.sms.services.MMCLIClient', return_value=client):
+        stats = refresh_stale_inbound_sms_rows(modem_index=0)
+    row = InboundSms.objects.get(mm_path=path)
+    assert stats['checked'] == 1
+    assert stats['marked_unavailable'] == 1
+    assert row.mm_state == 'unavailable'
+
+
 def test_post_save_requeues_webhook_when_text_patched():
     path = '/org/freedesktop/ModemManager1/SMS/mirror_patch'
     InboundSms.objects.create(

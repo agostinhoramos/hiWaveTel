@@ -58,6 +58,21 @@ def _looks_sqlite_concurrency_error(exc: BaseException) -> bool:
 _RETRY_MMCLI_SHOW_WHILE_STATES = frozenset({'receiving', 'unknown'})
 _STALE_MM_STATES = frozenset({'receiving', 'unknown', ''})
 _TERMINAL_MM_STATES = frozenset({'received', 'stored', 'sent', 'delivered'})
+_UNAVAILABLE_MM_STATES = frozenset({'unavailable', 'missing'})
+
+
+class SmsPathUnavailableError(Exception):
+    """Raised when ModemManager no longer exposes the SMS D-Bus object."""
+
+    def __init__(self, mm_path: str, *, cause: MmcliError | None = None) -> None:
+        super().__init__(mm_path)
+        self.mm_path = mm_path
+        self.cause = cause
+
+
+def _mmcli_sms_path_missing(exc: MmcliError) -> bool:
+    haystack = f'{exc}\n{exc.stderr or ""}\n{exc.stdout or ""}'.lower()
+    return "couldn't find sms" in haystack or 'not found in any modem' in haystack
 
 
 def _normalize_mm_state(state: str) -> str:
@@ -136,6 +151,9 @@ def _fetch_mmcli_snapshot_with_retries(
         try:
             raw = mm.show_sms(mm_path)
         except MmcliError as exc:
+            if _mmcli_sms_path_missing(exc):
+                _LOGGER.debug('mmcli SMS path no longer on modem: %s', mm_path)
+                raise SmsPathUnavailableError(mm_path, cause=exc) from exc
             _LOGGER.warning('mmcli show failed for %s: %s', mm_path, exc)
             raw = {}
 
@@ -196,8 +214,17 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     if debug:
         _LOGGER.info('persist_inbound_sms start mm_path=%s modem_index=%s', mm_path, modem_index)
 
-    with mmcli_serial():
-        raw = _fetch_mmcli_snapshot_with_retries(mm, mm_path, metrics=metrics)
+    try:
+        with mmcli_serial():
+            raw = _fetch_mmcli_snapshot_with_retries(mm, mm_path, metrics=metrics)
+    except SmsPathUnavailableError:
+        existing = InboundSms.objects.filter(mm_path=mm_path).first()
+        if existing is not None:
+            if _normalize_mm_state(existing.mm_state) not in _UNAVAILABLE_MM_STATES:
+                existing.mm_state = 'unavailable'
+                existing.save(update_fields=['mm_state'])
+            return existing
+        raise
 
     sms_class = (raw.get('smspropertiesclass') or raw.get('class') or '').lower()
     if 'multipart' in sms_class:
@@ -336,23 +363,60 @@ def persist_inbound_sms(mm_path: str, modem_index: int, client: MMCLIClient | No
     return obj
 
 
-def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, int]:
-    """Re-fetch mmcli snapshots for rows stuck with empty text or non-terminal mm_state."""
+def _stale_inbound_sms_queryset(modem_index: int | None = None):
+    """Rows that still need a modem snapshot (empty body or non-terminal MM state).
+
+    Rows with texto but blank ``mm_state`` are intentionally excluded — re-fetching
+    thousands of already-persisted messages hammers mmcli and spams logs when old
+    SMS paths were purged from ModemManager.
+    """
     from django.db.models import Q
 
-    qs = InboundSms.objects.filter(
-        Q(text='') | Q(text__isnull=True) | Q(mm_state__iexact='receiving') | Q(mm_state__iexact='unknown') | Q(mm_state='')
+    qs = InboundSms.objects.exclude(mm_state__iexact='unavailable').filter(
+        Q(text='')
+        | Q(text__isnull=True)
+        | Q(mm_state__iexact='receiving')
+        | Q(mm_state__iexact='unknown'),
     )
     if modem_index is not None:
         qs = qs.filter(modem_index=modem_index)
+    return qs
 
-    stats = {'checked': 0, 'text_filled': 0, 'state_updated': 0, 'still_stale': 0}
+
+def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, int]:
+    """Re-fetch mmcli snapshots for rows stuck with empty text or non-terminal mm_state."""
+    qs = _stale_inbound_sms_queryset(modem_index)
+
+    stats = {
+        'checked': 0,
+        'text_filled': 0,
+        'state_updated': 0,
+        'still_stale': 0,
+        'marked_unavailable': 0,
+    }
+    # #region agent log
+    try:
+        from apps.sms.modem_ready import _agent_debug_log
+
+        _agent_debug_log(
+            'services.py:refresh_stale_inbound_sms_rows',
+            'stale refresh batch start',
+            {'modem_index': modem_index, 'candidate_count': qs.count()},
+            'E',
+        )
+    except Exception:
+        pass
+    # #endregion
     for row in qs.order_by('pk').iterator(chunk_size=100):
         stats['checked'] += 1
         before_text = (row.text or '').strip()
         before_state = _normalize_mm_state(row.mm_state)
         try:
             updated = persist_inbound_sms(row.mm_path, row.modem_index, None)
+        except SmsPathUnavailableError:
+            InboundSms.objects.filter(pk=row.pk).update(mm_state='unavailable')
+            stats['marked_unavailable'] += 1
+            continue
         except Exception as exc:
             _LOGGER.warning(
                 'refresh_stale_inbound_sms_rows failed pk=%s path=%s: %s',
@@ -365,6 +429,9 @@ def refresh_stale_inbound_sms_rows(modem_index: int | None = None) -> dict[str, 
 
         after_text = (updated.text or '').strip()
         after_state = _normalize_mm_state(updated.mm_state)
+        if after_state in _UNAVAILABLE_MM_STATES:
+            stats['marked_unavailable'] += 1
+            continue
         if not before_text and after_text:
             stats['text_filled'] += 1
         if before_state in _STALE_MM_STATES and after_state not in _STALE_MM_STATES:
