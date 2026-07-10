@@ -125,6 +125,15 @@ async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
 
             await loop.run_in_executor(None, _refresh_modem_readiness)
 
+            def _recover_modem_if_needed() -> None:
+                from apps.sms.modem_ready import _READY_STATES, ensure_modem_ready_for_sms, get_modem_state
+
+                state = get_modem_state(modem_index)
+                if state not in _READY_STATES:
+                    ensure_modem_ready_for_sms(modem_index, require_messaging=True)
+
+            await loop.run_in_executor(None, _recover_modem_if_needed)
+
             metrics.increment('periodic_recovery_runs')
             _LOGGER.info(
                 'Periodic recovery: synced %s SMS paths, stale refresh %s (modem_index=%s)',

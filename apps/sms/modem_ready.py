@@ -123,17 +123,28 @@ def get_modem_state(modem_index: int, *, mmcli_path: str | None = None) -> str:
 
 
 _MODEM_PATH_RE = re.compile(r'/org/freedesktop/ModemManager1/Modem/(\d+)')
+_last_pin_missing_warn: dict[int, float] = {}
+
+
+def _warn_pin_missing(modem_index: int) -> None:
+    interval = float(os.environ.get('PIN_MISSING_WARN_INTERVAL_SEC', '60'))
+    now = time.monotonic()
+    last = _last_pin_missing_warn.get(modem_index, 0.0)
+    if now - last < interval:
+        return
+    _last_pin_missing_warn[modem_index] = now
+    _LOGGER.warning(
+        'Modem %s locked but %s is not set',
+        modem_index,
+        f'MODEM_{modem_index}_DEVICE_PIN_CODE',
+    )
 
 
 def try_unlock_sim_pin(modem_index: int, *, pin: str | None = None, mmcli_path: str | None = None) -> bool:
     """Run ``mmcli --pin`` on SIM and/or modem when the overview reports SIM-PIN lock."""
     code = pin if pin is not None else get_modem_pin_code(modem_index)
     if not code:
-        _LOGGER.warning(
-            'Modem %s locked but %s is not set',
-            modem_index,
-            f'MODEM_{modem_index}_DEVICE_PIN_CODE',
-        )
+        _warn_pin_missing(modem_index)
         return False
     path = mmcli_path or _mmcli_path()
     unlock_timeout = float(os.environ.get('SIM_UNLOCK_TIMEOUT_SEC', '60'))

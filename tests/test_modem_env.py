@@ -32,6 +32,17 @@ def test_get_modem_env_missing_returns_default():
     assert get_modem_env(99, 'DEVICE_PIN_CODE') == ''
 
 
+def test_get_modem_pin_code_single_modem_fallback(monkeypatch):
+    monkeypatch.setenv('MODEM_0_DEVICE_PIN_CODE', '1369')
+    assert get_modem_pin_code(1) == '1369'
+
+
+def test_get_modem_pin_code_no_fallback_when_multiple_pins(monkeypatch):
+    monkeypatch.setenv('MODEM_0_DEVICE_PIN_CODE', '1111')
+    monkeypatch.setenv('MODEM_1_DEVICE_PIN_CODE', '2222')
+    assert get_modem_pin_code(2) == ''
+
+
 def test_list_modem_indices_from_env(monkeypatch):
     monkeypatch.setenv('MODEM_0_DEVICE_PIN_CODE', '1111')
     monkeypatch.setenv('MODEM_2_DEVICE_PHONE_NUMBER', '351900000002')

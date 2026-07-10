@@ -28,8 +28,22 @@ def get_modem_env(modem_index: int, suffix: str, default: str = '') -> str:
 
 
 def get_modem_pin_code(modem_index: int) -> str:
-    """SIM PIN for the given mmcli modem index."""
-    return get_modem_env(modem_index, 'DEVICE_PIN_CODE')
+    """SIM PIN for the given mmcli modem index.
+
+    When ``MODEM_N_DEVICE_PIN_CODE`` is unset and exactly one
+    ``MODEM_*_DEVICE_PIN_CODE`` exists (single-modem deployment), use that PIN.
+    """
+    code = get_modem_env(modem_index, 'DEVICE_PIN_CODE')
+    if code:
+        return code
+    pins_by_index: dict[int, str] = {}
+    for idx in list_modem_indices_from_env():
+        pin = get_modem_env(idx, 'DEVICE_PIN_CODE')
+        if pin:
+            pins_by_index[idx] = pin
+    if len(pins_by_index) == 1:
+        return next(iter(pins_by_index.values()))
+    return ''
 
 
 def get_modem_phone_number(modem_index: int) -> str:
