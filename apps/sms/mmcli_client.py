@@ -293,7 +293,12 @@ def resolve_modem_mmcli_index(
         )
 
     def _ready(idx: int) -> bool:
-        return get_modem_state(idx, mmcli_path=mm.mmcli_path) in {'enabled', 'registered'}
+        state_ok = get_modem_state(idx, mmcli_path=mm.mmcli_path) in {'enabled', 'registered'}
+        if not state_ok:
+            return False
+        from apps.sms.modem_ready import messaging_interface_ready
+
+        return messaging_interface_ready(idx, mmcli_path=mm.mmcli_path)
 
     if want in present and _ready(want):
         return want
@@ -308,6 +313,7 @@ def resolve_modem_mmcli_index(
             )
             return idx
 
+    # Prefer configured or any present index even when messaging is not yet up.
     if want in present:
         return want
 

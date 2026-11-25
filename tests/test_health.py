@@ -14,22 +14,53 @@ pytestmark = pytest.mark.django_db
 
 
 def test_health_modem_ok(api_client):
-    with patch.object(MMCLIClient, 'modem_ping') as mp, patch.object(MMCLIClient, 'list_modem_indices') as ml:
+    with patch.object(MMCLIClient, 'modem_ping') as mp, patch.object(MMCLIClient, 'list_modem_indices') as ml, patch(
+        'apps.sms.views_health.messaging_interface_ready',
+        return_value=True,
+    ):
         ml.return_value = [0]
         mp.return_value = (True, '')
         resp = api_client.get(reverse('api-health-mm'))
     assert resp.status_code == 200
     assert resp.json().get('ok') is True
+    assert resp.json().get('modem_messaging_ok') is True
 
 
 def test_health_modem_index_mismatch(api_client):
-    with override_settings(MODEM_MMCLI_INDEX=99), patch.object(MMCLIClient, 'modem_ping'), patch.object(
+    with override_settings(MODEM_MMCLI_INDEX=99), patch.object(
+        MMCLIClient,
+        'modem_ping',
+        return_value=(True, ''),
+    ), patch.object(
         MMCLIClient,
         'list_modem_indices',
         return_value=[0],
-    ):
+    ), patch(
+        'apps.sms.views_health.resolve_modem_mmcli_index',
+        return_value=0,
+    ), patch('apps.sms.views_health.messaging_interface_ready', return_value=True):
         resp = api_client.get(reverse('api-health-mm'))
     assert resp.status_code == 503
+    body = resp.json()
+    assert body.get('modem_index_ok') is False
+    assert body.get('effective_modem_mmcli_index') == 0
+    assert body.get('ok') is False
+
+
+def test_health_modem_ok_when_configured_matches_effective(api_client):
+    with override_settings(MODEM_MMCLI_INDEX=0), patch.object(
+        MMCLIClient,
+        'modem_ping',
+        return_value=(True, ''),
+    ), patch.object(MMCLIClient, 'list_modem_indices', return_value=[0]), patch(
+        'apps.sms.views_health.resolve_modem_mmcli_index',
+        return_value=0,
+    ), patch('apps.sms.views_health.messaging_interface_ready', return_value=True):
+        resp = api_client.get(reverse('api-health-mm'))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get('modem_index_ok') is True
+    assert body.get('ok') is True
 
 
 def test_health_no_modems(api_client):
@@ -46,9 +77,29 @@ def test_health_ping_failure(api_client):
         MMCLIClient,
         'modem_ping',
         return_value=(False, 'modem offline'),
+    ), patch(
+        'apps.sms.views_health.messaging_interface_ready',
+        return_value=True,
     ), override_settings(MODEM_MMCLI_INDEX=0):
         resp = api_client.get(reverse('api-health-mm'))
     assert resp.status_code == 503
+
+
+def test_health_messaging_failure(api_client):
+    with patch.object(MMCLIClient, 'list_modem_indices', return_value=[0]), patch.object(
+        MMCLIClient,
+        'modem_ping',
+        return_value=(True, ''),
+    ), patch(
+        'apps.sms.views_health.messaging_interface_ready',
+        return_value=False,
+    ), override_settings(MODEM_MMCLI_INDEX=0):
+        resp = api_client.get(reverse('api-health-mm'))
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body.get('modem_messaging_ok') is False
+    assert body.get('ok') is False
+    assert 'messaging-list-sms' in (body.get('mmcli_notes') or '')
 
 
 def test_health_mmcli_error(api_client):

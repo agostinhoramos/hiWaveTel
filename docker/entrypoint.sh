@@ -300,6 +300,12 @@ if truthy "${RUN_WEBHOOK_WORKER:-true}"; then
   echo 'Webhook delivery worker started in background.'
 fi
 
+if truthy "${RUN_MODEM_WATCHDOG:-true}"; then
+  HIWAVETEL_ROLE=watchdog HIWAVETEL_QUEUE_ENABLED=false \
+    python manage.py run_modem_watchdog &
+  echo 'Modem watchdog worker started in background.'
+fi
+
 HIWAVE_PORT="${HIWAVE_PORT:-8000}"
 export HIWAVETEL_ROLE=api
 export HIWAVETEL_QUEUE_ENABLED=false

@@ -188,6 +188,35 @@ SMS_CLEANUP_ON_STARTUP = truthy_env('SMS_CLEANUP_ON_STARTUP', default=False)
 # SMS reliability & recovery (apps/sms/dbus_watch.py, dead_letter_queue.py)
 MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC = positive_int_env('MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 60)
 SMS_DLQ_ENABLED = truthy_env('SMS_DLQ_ENABLED', default=True)
+
+# Modem watchdog (apps/sms/modem_watchdog.py)
+RUN_MODEM_WATCHDOG = truthy_env('RUN_MODEM_WATCHDOG', default=True)
+MODEM_WATCHDOG_INTERVAL_SEC = positive_int_env('MODEM_WATCHDOG_INTERVAL_SEC', 60)
+if MODEM_WATCHDOG_INTERVAL_SEC <= 0:
+    MODEM_WATCHDOG_INTERVAL_SEC = 60
+MODEM_WATCHDOG_FAILURE_THRESHOLD = positive_int_env('MODEM_WATCHDOG_FAILURE_THRESHOLD', 3)
+if MODEM_WATCHDOG_FAILURE_THRESHOLD <= 0:
+    MODEM_WATCHDOG_FAILURE_THRESHOLD = 3
+_modem_watchdog_soft_cooldown_raw = os.environ.get('MODEM_WATCHDOG_SOFT_COOLDOWN_SEC', '120').strip()
+try:
+    MODEM_WATCHDOG_SOFT_COOLDOWN_SEC = float(_modem_watchdog_soft_cooldown_raw or 120)
+except ValueError:
+    MODEM_WATCHDOG_SOFT_COOLDOWN_SEC = 120.0
+_modem_watchdog_mm_cooldown_raw = os.environ.get('MODEM_WATCHDOG_MM_RESTART_COOLDOWN_SEC', '600').strip()
+try:
+    MODEM_WATCHDOG_MM_RESTART_COOLDOWN_SEC = float(_modem_watchdog_mm_cooldown_raw or 600)
+except ValueError:
+    MODEM_WATCHDOG_MM_RESTART_COOLDOWN_SEC = 600.0
+_modem_watchdog_container_cooldown_raw = os.environ.get(
+    'MODEM_WATCHDOG_CONTAINER_RESTART_COOLDOWN_SEC',
+    '3600',
+).strip()
+try:
+    MODEM_WATCHDOG_CONTAINER_RESTART_COOLDOWN_SEC = float(_modem_watchdog_container_cooldown_raw or 3600)
+except ValueError:
+    MODEM_WATCHDOG_CONTAINER_RESTART_COOLDOWN_SEC = 3600.0
+MODEM_WATCHDOG_AUTO_CONTAINER_RESTART = truthy_env('MODEM_WATCHDOG_AUTO_CONTAINER_RESTART', default=True)
+MODEM_WATCHDOG_AUTO_MM_RESTART = truthy_env('MODEM_WATCHDOG_AUTO_MM_RESTART', default=True)
 SMS_DLQ_DB_PATH = os.environ.get('SMS_DLQ_DB_PATH', str(BASE_DIR / 'dlq_sms.db'))
 SMS_DLQ_MAX_SIZE = positive_int_env('SMS_DLQ_MAX_SIZE', 1000)
 SMS_DLQ_RETRY_INTERVAL_SEC = positive_int_env('SMS_DLQ_RETRY_INTERVAL_SEC', 60)

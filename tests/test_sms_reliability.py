@@ -157,14 +157,77 @@ class TestDbusWatchReliability:
         assert metrics['dbus_signals_received'] >= 1
 
     def test_periodic_recovery_calls_snapshot(self):
+        stale_stats = {
+            'checked': 0,
+            'text_filled': 0,
+            'state_updated': 0,
+            'still_stale': 0,
+            'marked_unavailable': 0,
+        }
+
         async def _run() -> None:
-            with patch('apps.sms.dbus_watch.sync_modem_sms_snapshot', return_value=2) as mock_sync:
+            with patch('apps.sms.dbus_watch.resolve_modem_mmcli_index', return_value=0), patch(
+                'apps.sms.dbus_watch.sync_modem_sms_snapshot',
+                return_value=2,
+            ) as mock_sync, patch(
+                'apps.sms.services.refresh_stale_inbound_sms_rows',
+                return_value=stale_stats,
+            ), patch(
+                'apps.sms.modem_readiness.refresh_readiness_safe',
+            ), patch(
+                'apps.sms.modem_ready.get_modem_state',
+                return_value='registered',
+            ), patch(
+                'apps.sms.modem_ready.messaging_interface_ready',
+                return_value=True,
+            ):
                 task = asyncio.create_task(_periodic_recovery_loop(0, 0.05))
                 await asyncio.sleep(0.12)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             assert mock_sync.call_count >= 1
+
+        asyncio.run(_run())
+
+
+@pytest.mark.django_db
+class TestPeriodicRecovery:
+    @override_settings(MODEM_WATCHDOG_FAILURE_THRESHOLD=3)
+    def test_periodic_recovery_triggers_soft_recovery_on_messaging_failures(self):
+        stale_stats = {
+            'checked': 0,
+            'text_filled': 0,
+            'state_updated': 0,
+            'still_stale': 0,
+            'marked_unavailable': 0,
+        }
+
+        async def _run() -> None:
+            with patch('apps.sms.dbus_watch.resolve_modem_mmcli_index', return_value=0), patch(
+                'apps.sms.dbus_watch.sync_modem_sms_snapshot',
+                return_value=0,
+            ), patch(
+                'apps.sms.services.refresh_stale_inbound_sms_rows',
+                return_value=stale_stats,
+            ), patch(
+                'apps.sms.modem_readiness.refresh_readiness_safe',
+            ), patch(
+                'apps.sms.modem_ready.get_modem_state',
+                return_value='registered',
+            ), patch(
+                'apps.sms.modem_ready.messaging_interface_ready',
+                return_value=False,
+            ), patch(
+                'apps.sms.modem_watchdog.attempt_soft_recovery',
+                return_value=False,
+            ) as soft:
+                task = asyncio.create_task(_periodic_recovery_loop(0, 0.03))
+                await asyncio.sleep(0.15)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            soft.assert_called_once_with(0)
 
         asyncio.run(_run())
 

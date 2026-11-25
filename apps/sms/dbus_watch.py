@@ -100,16 +100,37 @@ def sync_modem_sms_snapshot(modem_index: int, client: MMCLIClient | None = None)
     return n
 
 
-async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
+async def _periodic_recovery_loop(configured_index: int, interval_sec: int) -> None:
     """Background periodic mmcli snapshot to recover SMS missed during D-Bus gaps."""
     if interval_sec <= 0:
         return
     loop = asyncio.get_running_loop()
     metrics = get_metrics_collector()
+    messaging_failures = 0
+    failure_threshold = max(1, int(getattr(settings, 'MODEM_WATCHDOG_FAILURE_THRESHOLD', 3)))
     while True:
         await asyncio.sleep(interval_sec)
         try:
+            def _resolve_index() -> int:
+                return resolve_modem_mmcli_index(configured_index)
+
+            modem_index = await loop.run_in_executor(None, _resolve_index)
             count = await loop.run_in_executor(None, sync_modem_sms_snapshot, modem_index)
+
+            if count == 0:
+                from apps.sms.modem_ready import messaging_interface_ready
+
+                messaging_ok = await loop.run_in_executor(
+                    None,
+                    lambda: messaging_interface_ready(modem_index),
+                )
+                if not messaging_ok:
+                    messaging_failures += 1
+                else:
+                    messaging_failures = 0
+            else:
+                messaging_failures = 0
+
             from .services import refresh_stale_inbound_sms_rows
 
             stale_stats = await loop.run_in_executor(
@@ -134,6 +155,21 @@ async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
 
             await loop.run_in_executor(None, _recover_modem_if_needed)
 
+            if messaging_failures >= failure_threshold:
+                from apps.sms.modem_watchdog import attempt_soft_recovery
+
+                _LOGGER.warning(
+                    'Periodic recovery: messaging failures=%s threshold=%s; soft recovery',
+                    messaging_failures,
+                    failure_threshold,
+                )
+                await loop.run_in_executor(
+                    None,
+                    attempt_soft_recovery,
+                    configured_index,
+                )
+                messaging_failures = 0
+
             metrics.increment('periodic_recovery_runs')
             _LOGGER.info(
                 'Periodic recovery: synced %s SMS paths, stale refresh %s (modem_index=%s)',
@@ -142,7 +178,7 @@ async def _periodic_recovery_loop(modem_index: int, interval_sec: int) -> None:
                 modem_index,
             )
         except Exception as exc:
-            _LOGGER.exception('Periodic recovery failed modem_index=%s: %s', modem_index, exc)
+            _LOGGER.exception('Periodic recovery failed modem_index=%s: %s', configured_index, exc)
 
 
 async def _persist_async(mm_path: str, modem_index: int) -> None:
@@ -268,12 +304,12 @@ async def run_modem_added_listener(
             recovery_interval = int(getattr(settings, 'MODEM_SNAPSHOT_RECOVERY_INTERVAL_SEC', 300))
             if recovery_interval > 0:
                 recovery_task = asyncio.create_task(
-                    _periodic_recovery_loop(modem_index, recovery_interval),
-                    name=f'sms-periodic-recovery-{modem_index}',
+                    _periodic_recovery_loop(configured_index, recovery_interval),
+                    name=f'sms-periodic-recovery-{configured_index}',
                 )
                 _LOGGER.info(
                     'Periodic SMS recovery enabled modem_index=%s interval_sec=%s',
-                    modem_index,
+                    configured_index,
                     recovery_interval,
                 )
 

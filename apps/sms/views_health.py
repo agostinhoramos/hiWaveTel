@@ -11,6 +11,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
 
 from .mmcli_client import MMCLIClient, MmcliError, resolve_modem_mmcli_index
+from .modem_ready import messaging_interface_ready
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ def health_modem_manager(request: HttpRequest) -> JsonResponse:  # noqa: ARG001
         'modem_mmcli_indices': [],
         'settings_modem_mmcli_index': settings.MODEM_MMCLI_INDEX,
         'modem_mmcli_ping_ok': False,
+        'modem_messaging_ok': False,
         'mmcli_notes': '',
     }
 
@@ -47,17 +49,26 @@ def health_modem_manager(request: HttpRequest) -> JsonResponse:  # noqa: ARG001
             return JsonResponse(payload, status=503)
 
         payload['effective_modem_mmcli_index'] = effective
-        if effective != configured:
+        index_ok = effective == int(configured)
+        payload['modem_index_ok'] = index_ok
+        if not index_ok:
             payload['mmcli_notes'] = (
-                f'MODEM_MMCLI_INDEX={configured} not in {indices}; using primary modem {effective}.'
+                f'MODEM_MMCLI_INDEX={configured} resolved to effective modem {effective} '
+                f'(present={indices}).'
             )
 
         ping_ok, ping_text = client.modem_ping(effective)
         payload['modem_mmcli_ping_ok'] = ping_ok
+        messaging_ok = messaging_interface_ready(effective, mmcli_path=client.mmcli_path)
+        payload['modem_messaging_ok'] = messaging_ok
         if not ping_ok and ping_text:
             payload['mmcli_notes'] = ping_text.replace('\n', ' ')[:2000]
+        elif not messaging_ok:
+            payload['mmcli_notes'] = (
+                f'mmcli --messaging-list-sms failed for modem {effective}.'
+            )
 
-        payload['ok'] = ping_ok
+        payload['ok'] = ping_ok and messaging_ok and index_ok
 
         http_status = 200 if payload['ok'] else 503
         return JsonResponse(payload, status=http_status)
